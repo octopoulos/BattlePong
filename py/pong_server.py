@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-07-29
+# @version 2022-07-31
 
 """
 Pong server
@@ -16,30 +16,27 @@ from pong_common import *
 
 
 class PongServer(Pong):
-	def __init__(self):
-		super(PongServer, self).__init__()
-		print('PongServer')
+	def __init__(self, **kwargs):
+		super(PongServer, self).__init__(**kwargs)
+		print('PongServer', kwargs)
 
-		self.connId = 0
-		self.frame = 0
-		self.id = 0
+		self.connId  = 0
+		self.id      = 0
 		self.players = {}
 		self.running = True
-		self.server = None
-		self.slots = [None, None, None, None]
-		self.start = time()
+		self.server  = None                                      # type: pyuv.TCP
+		self.slots   = [None, None, None, None]
 
-		self.loop = pyuv.Loop.default_loop()
+		self.loop     = pyuv.Loop.default_loop()
 		self.signal_h = pyuv.Signal(self.loop)
 
 	# HELPERS
 	#########
 
-	def AddPlayer(self, client: pyuv.TCP) -> int:
+	def AddPlayer(self, client: pyuv.TCP, wantSlot: int) -> int:
 		ip, port = client.getpeername()
-		slot = self.FindSlot()
-		if slot < 4:
-			self.slots[slot] = client
+		slot     = self.FindSlot(wantSlot)
+		if slot < len(self.slots): self.slots[slot] = client
 		self.players[client] = [slot, ip, port, 0, 0, 0]
 		print('AddPlayer: players=')
 		self.PrintPlayers()
@@ -52,11 +49,14 @@ class PongServer(Pong):
 			print('DeletePlayer: players=')
 			self.PrintPlayers()
 
-	def FindSlot(self) -> int:
+	def FindSlot(self, wantSlot: int) -> int:
+		numSlot = len(self.slots)
+		if 0 <= wantSlot <= numSlot and not self.slots[wantSlot]: return wantSlot
+
 		for i, slot in enumerate(self.slots):
 			if not slot: return i
 		# spectator
-		return 4
+		return numSlot
 
 	def PrintPlayers(self):
 		print(self.slots)
@@ -71,7 +71,6 @@ class PongServer(Pong):
 		client = pyuv.TCP(self.loop)
 		self.server.accept(client)
 		client.start_read(self.OnRead)
-		# self.AddPlayer(client)
 
 	def OnRead(self, client: pyuv.TCP, data: bytes, error: int):
 		if data is None:
@@ -79,8 +78,8 @@ class PongServer(Pong):
 			self.DeletePlayer(client)
 			return
 
-		player = self.players.get(client)
-		pid = player[0] if player else -1
+		player  = self.players.get(client)
+		pid     = player[0] if player else -1
 		hasHttp = 0
 
 		for line in data.decode().split('\r\n'):
@@ -94,7 +93,7 @@ class PongServer(Pong):
 			# paddle
 			if line[0] == 'P':
 				items = line[1:].split(':')
-				if 0 <= pid <= 3 and len(items) > 1 and int(items[0]) == pid:
+				if 0 <= pid <= 3 and len(items) > 1 and DefaultInt(items[0], -1) == pid:
 					self.paddles[pid].Parse(items)
 
 					for sid, slot in enumerate(self.slots):
@@ -103,7 +102,8 @@ class PongServer(Pong):
 
 			# 2) connection
 			elif line[0] == 'I':
-				if pid < 0: pid = self.AddPlayer(client)
+				wantSlot = DefaultInt(line[1:], -1)
+				if pid < 0: pid = self.AddPlayer(client, wantSlot)
 				self.Send(client, f'I{pid}\r\n')
 				for ball in self.balls:
 					self.Send(client, ball.Format())
@@ -111,7 +111,7 @@ class PongServer(Pong):
 			# 3) http
 			elif line[0: 5] == 'GET /':
 				hasHttp = 1
-				ball = self.balls[0]
+				speed   = self.balls[0].body.linearVelocity
 
 				html = ''.join([
 					'<html>',
@@ -119,7 +119,7 @@ class PongServer(Pong):
 						'<h1>Battle Pong</h1>',
 						f'<div>Balls: {len(self.balls)}</div>',
 						f'<div>Players: {len(self.players)}</div>',
-						f'<div>Speed: {sqrt(ball.vx * ball.vx + ball.vy * ball.vy)}</div>',
+						f'<div>Speed: {sqrt(speed[0] * speed[1] + speed[1] * speed[1])}</div>',
 					'</body>',
 					'</html>',
 				])
@@ -156,8 +156,7 @@ class PongServer(Pong):
 	######
 
 	def NewGame(self):
-		self.ResetBalls()
-		self.PrintBalls()
+		super(PongServer, self).NewGame()
 
 		for slot in self.slots:
 			if slot:
@@ -165,47 +164,27 @@ class PongServer(Pong):
 					if player := self.players.get(slot): player[0] = 1
 					self.Send(slot, ball.Format())
 
-		self.frame = 0
-		self.start = time()
-
-	def Physics(self):
-		if dirty := self.MoveBalls():
-			for bid, ball in enumerate(self.balls):
-				if (dirty & (1 << bid)) == 0: continue
-
-				print(self.frame, time() - self.start, dirty, bid, ball)
-				for slot in self.slots:
-					if slot: self.Send(slot, ball.Format())
-
 	# MAIN LOOP
 	###########
 
 	def Run(self):
 		self.server = pyuv.TCP(self.loop)
-		self.server.bind(("127.0.0.1", 1234))
+		self.server.bind((self.host, self.port))
 		self.server.listen(self.OnConnect)
 		self.connected = True
 
 		self.signal_h.start(self.Signal, signal.SIGINT)
 
 		self.NewGame()
-		doneFrame = 0
 
 		while self.running:
-			elapsed = time() - self.start
-			wantFrame = elapsed * PHYSICS_FPS
-
-			while doneFrame < wantFrame:
-				self.Physics()
-				doneFrame += 1
-				# print(f'{doneFrame}/{wantFrame}')
-
+			self.PhysicsLoop()
 			self.loop.run(pyuv.UV_RUN_NOWAIT)
 
 
-def MainServer():
+def MainServer(**kwargs):
 	print(f'Server: pyuv={pyuv.__version__}')
-	server = PongServer()
+	server = PongServer(**kwargs)
 	server.Run()
 	print('Goodbye.')
 

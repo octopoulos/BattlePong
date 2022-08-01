@@ -3,4 +3,4 @@
 from distutils.core import setup
 import py2exe
 
-setup(console=['pong_client.py'])
+setup(console=['__main__.py'])
