@@ -1,18 +1,21 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-07-31
+# @version 2022-08-01
 
 """
 Pong server
 """
 
+from itertools import chain
 from math import sqrt
 import signal
-from time import time
+import struct
+from typing import List
 
 import pyuv
 
-from pong_common import *
+from common import DefaultInt
+from pong_common import Body, Pong
 
 
 class PongServer(Pong):
@@ -24,7 +27,7 @@ class PongServer(Pong):
 		self.id      = 0
 		self.players = {}
 		self.running = True
-		self.server  = None                                      # type: pyuv.TCP
+		self.server  = None                                 # type: pyuv.TCP
 		self.slots   = [None, None, None, None]
 
 		self.loop     = pyuv.Loop.default_loop()
@@ -78,68 +81,86 @@ class PongServer(Pong):
 			self.DeletePlayer(client)
 			return
 
-		player  = self.players.get(client)
-		pid     = player[0] if player else -1
-		hasHttp = 0
+		player = self.players.get(client)
+		pid    = player[0] if player else -1
 
-		for line in data.decode().split('\r\n'):
-			if not line:
-				if hasHttp: hasHttp += 1
-				continue
-			elif hasHttp and hasHttp < 3:
-				continue
+		while len(data):
+			if data[0] == 0:
+				# 1) game
+				# paddle
+				if data[1] == ord('P'):
+					pid = data[2]
+					if 0 <= pid < len(self.paddles):
+						message = data[:32]
+						self.paddles[pid].Parse(message)
 
-			# 1) game
-			# paddle
-			if line[0] == 'P':
-				items = line[1:].split(':')
-				if 0 <= pid <= 3 and len(items) > 1 and DefaultInt(items[0], -1) == pid:
-					self.paddles[pid].Parse(items)
+						for sid, slot in enumerate(self.slots):
+							if sid != pid and slot:
+								self.Send(slot, message)
 
-					for sid, slot in enumerate(self.slots):
-						if sid != pid and slot:
-							self.Send(slot, f'{line}\r\n')
+					data = data[32:]
 
-			# 2) connection
-			elif line[0] == 'I':
-				wantSlot = DefaultInt(line[1:], -1)
-				if pid < 0: pid = self.AddPlayer(client, wantSlot)
-				self.Send(client, f'I{pid}\r\n')
-				for ball in self.balls:
-					self.Send(client, ball.Format())
+				# 2) connection
+				elif data[1] == ord('I'):
+					wantSlot = data[2]
+					if pid < 0: pid = self.AddPlayer(client, wantSlot)
+					self.Send(client, struct.pack('xBB', ord('I'), pid))
 
-			# 3) http
-			elif line[0: 5] == 'GET /':
-				hasHttp = 1
-				speed   = self.balls[0].body.linearVelocity
+					for obj in chain(self.balls, self.paddles):
+						self.Send(client, obj.Format())
 
-				html = ''.join([
-					'<html>',
-					'<body>',
-						'<h1>Battle Pong</h1>',
-						f'<div>Balls: {len(self.balls)}</div>',
-						f'<div>Players: {len(self.players)}</div>',
-						f'<div>Speed: {sqrt(speed[0] * speed[1] + speed[1] * speed[1])}</div>',
-					'</body>',
-					'</html>',
-				])
+					data = data[3:]
 
-				response = '\r\n'.join([
-					'HTTP/1.1 200 OK',
-					'Date: Sun, 18 Oct 2012 10:36:20 GMT',
-					'Server: Custom/1.0.0',
-					f'Content-Length: {len(html) + 4}',
-					'Content-Type: text/html; charset=UTF-8',
-					'',
-					html,
-					'<html><body><h1>Hello there!</h1></body></html>',
-					'',
-					'',
-				])
-				self.Send(client, response)
-				self.DeletePlayer(client)
+				else:
+					print(f'player_{pid}:', data)
 			else:
-				print(f'player_{pid}:', line)
+				if data[0: 5] == b'GET /':
+					i = 5
+					size = len(data)
+					while i < size:
+						if data[i] == 0:
+							data = data[i:]
+							break
+						i += 1
+
+					if i == size: data = data[i:]
+
+					speed = self.balls[0].body.linearVelocity
+					html  = ''.join([
+						'<html>',
+						'<body>',
+							'<h1>Battle Pong</h1>',
+							f'<div>Balls: {len(self.balls)}</div>',
+							f'<div>Players: {len(self.players)}</div>',
+							f'<div>Speed: {sqrt(speed[0] * speed[1] + speed[1] * speed[1])}</div>',
+						'</body>',
+						'</html>',
+					])
+
+					response = '\r\n'.join([
+						'HTTP/1.1 200 OK',
+						'Date: Sun, 18 Oct 2012 10:36:20 GMT',
+						'Server: Custom/1.0.0',
+						f'Content-Length: {len(html) + 4}',
+						'Content-Type: text/html; charset=UTF-8',
+						'',
+						html,
+						'<html><body><h1>Hello there!</h1></body></html>',
+						'',
+						'',
+					])
+					self.Send(client, response)
+					self.DeletePlayer(client)
+				else:
+					print(f'player_{pid}:', data)
+					break
+
+	def ShareObjects(self, objects: List[Body], flag: int, skipId: int = -1):
+		for sid, slot in enumerate(self.slots):
+			if slot and sid != skipId:
+				for oid, obj in enumerate(objects):
+					if flag == -1 or (flag & (1 << oid)):
+						self.Send(slot, obj.Format())
 
 	def Signal(self, handle: pyuv.Signal, signum: int):
 		for client in self.players:
@@ -159,10 +180,11 @@ class PongServer(Pong):
 		super(PongServer, self).NewGame()
 
 		for slot in self.slots:
-			if slot:
-				for ball in self.balls:
-					if player := self.players.get(slot): player[0] = 1
-					self.Send(slot, ball.Format())
+			if slot and (player := self.players.get(slot)):
+				player[0] = 1
+
+		self.ShareObjects(self.balls, -1)
+		self.ShareObjects(self.paddles, -1)
 
 	# MAIN LOOP
 	###########
@@ -176,10 +198,14 @@ class PongServer(Pong):
 		self.signal_h.start(self.Signal, signal.SIGINT)
 
 		self.NewGame()
+		self.AddBall(2)
 
 		while self.running:
 			self.PhysicsLoop()
 			self.loop.run(pyuv.UV_RUN_NOWAIT)
+
+			if self.ballDirty: self.ShareObjects(self.balls, self.ballDirty)
+			if self.paddleDirty: self.ShareObjects(self.paddles, self.paddleDirty)
 
 
 def MainServer(**kwargs):

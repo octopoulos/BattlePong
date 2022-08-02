@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-07-31
+# @version 2022-08-01
 
 """
 Pong common
@@ -10,34 +10,40 @@ Pong common
 from itertools import chain
 from math import cos, pi, sin
 from random import random
+import struct
 from time import time
 from typing import List
 
 from Box2D import b2CircleShape, b2ContactListener, b2FixtureDef, b2PolygonShape, b2World
 import pyuv
 
-from common import *
+from common import DefaultInt
 
-VERSION = '2022-07-31'
+VERSION = '2022-08-01'
 
 # game
-BALL_ANGLE     = 0.3
+BALL_ANGLE     = 0.3       # min starting throw angle
 BALL_SPEED_MAX = 20
 BALL_SPEED_MED = 15
 BALL_SPEED_MIN = 7
 BALL_X         = 0.16
 BALL_Y         = 0.16
-PADDLE_ACCEL   = 0.5
+PADDLE_ACCEL   = 0.2
 PADDLE_BOUNCE  = 0.15
-PADDLE_GAP     = 0.32
+PADDLE_FORCE   = 50        # max moving force
+PADDLE_GAP     = 0.73      # space between border and paddle
+PADDLE_HIT     = 0.12      # impulse angle
+PADDLE_IMPULSE = 0.2       # impulse speed
 PADDLE_X       = 0.16
 PADDLE_Y       = 1.28
 PHYSICS_FPS    = 120
-PHYSICS_IT_POS = 3
-PHYSICS_IT_VEL = 8
+PHYSICS_IT_POS = 3         # number of position iterations
+PHYSICS_IT_VEL = 8         # number of velocity iterations
 SCALE          = 100
 SCREEN_X       = 1000
 SCREEN_Y       = 1000
+ZONE_X2        = 6
+ZONE_Y2        = 6
 
 # derived
 BALL_SPEED_MAX2 = BALL_SPEED_MAX * BALL_SPEED_MAX
@@ -48,39 +54,48 @@ PADDLE_Y2       = PADDLE_Y / 2
 PHYSICS_STEP    = 1 / PHYSICS_FPS
 SCREEN_X2       = SCREEN_X // 2
 SCREEN_Y2       = SCREEN_Y // 2
-ZONE_X2         = SCREEN_X2 / SCALE
-ZONE_Y2         = SCREEN_Y2 / SCALE
+
+# hits
+HIT_BALL_BALL     = 1 << 0
+HIT_BALL_PADDLE   = 1 << 1
+HIT_BALL_WALL     = 1 << 2
+HIT_PADDLE_PADDLE = 1 << 3
+HIT_PADDLE_WALL   = 1 << 4
 
 
 class Body:
-	def __init__(self, name: str, id: int, x: float, y: float):
+	def __init__(self, name: str, id: int, x: float, y: float, angle: float):
+		self.letter    = ord(name[0])
 		self.name      = name
 		self.id        = id
 		self.alive     = 1
-		self.angle     = 0                # interpolated angle
-		self.angle0    = 0                # initial angle
-		self.angle1    = 0                # prev angle
-		self.position  = (0, 0)           # interpolated position
+		self.angle     = angle            # interpolated angle
+		self.angle0    = angle            # initial angle
+		self.angle1    = angle            # prev angle
+		self.position  = (x, y)           # interpolated position
 		self.position0 = (x, y)           # initial position
-		self.position1 = (0, 0)           # prev position
+		self.position1 = (x, y)           # prev position
+		self.score     = 0
 		self.body      = None
 
 	def __str__(self):
 		body = self.body
-		return f'<{self.name}: id={self.id} alive={self.alive} pos=({body.position[0]},{body.position[1]}) vel=({body.linearVelocity[0]},{body.linearVelocity[1]}) rot={body.angle} rotVel={body.angularVelocity}>'
+		pos  = body.position
+		vel  = body.linearVelocity
+		return f'<{self.name}: id={self.id} alive={self.alive} pos=({pos[0]},{pos[1]}) vel=({vel[0]},{vel[1]}) rot={body.angle} rotVel={body.angularVelocity}>'
 
-	def Format(self) -> str:
+	def Format(self) -> bytes:
 		body = self.body
-		return f'{self.name[0]}{self.id}:{self.alive}:{body.position[0]}:{body.position[1]}:{body.linearVelocity[0]}:{body.linearVelocity[1]}:{body.angle}:{body.angularVelocity}\r\n'
+		pos  = body.position
+		vel  = body.linearVelocity
+		return struct.pack('xBBBffffffi', self.letter, self.id, self.alive, pos[0], pos[1], vel[0], vel[1], body.angle, body.angularVelocity, self.score)
 
-	def Parse(self, items: List[str]) -> bool:
-		if len(items) != 8: return False
-		body                 = self.body
-		self.alive           = DefaultInt(items[1], 1)
-		body.position        = (float(items[2], float(items[3])))
-		body.linearVelocity  = (float(items[4], float(items[5])))
-		body.angle           = float(items[6])
-		body.angularVelocity = float(items[7])
+	def Parse(self, message: bytes) -> bool:
+		body = self.body
+		_, _, self.alive, posx, posy, velx, vely, body.angle, body.angularVelocity, self.score = struct.unpack('xBBBffffffi', message)
+
+		body.position       = (posx, posy)
+		body.linearVelocity = (velx, vely)
 		return True
 
 	def Reset(self):
@@ -93,31 +108,30 @@ class Body:
 		body.angle           = self.angle
 		body.angularVelocity = 0.0
 		body.linearVelocity  = (0.0, 0.0)
-		body.position        = (self.position[0], self.position[1])
+		body.position        = (self.position0[0], self.position0[1])
 
 
 class Ball(Body):
-	def __init__(self, world: b2World, id: int, x: float, y: float):
-		super(Ball, self).__init__('Ball', id, x, y)
+	def __init__(self, world: b2World, id: int, x: float, y: float, angle: float):
+		super(Ball, self).__init__('Ball', id, x, y, angle)
 
 		self.body = world.CreateDynamicBody(
 			allowSleep = False,
 			bullet     = True,
-			# fixtures   = b2FixtureDef(shape=b2PolygonShape(box=(BALL_X2, BALL_X2)), density=1.0, restitution=1.0),
-			fixtures   = b2FixtureDef(shape=b2CircleShape(radius=BALL_X2), density=1.0, restitution=1.01),
+			fixtures   = b2FixtureDef(shape=b2CircleShape(radius=BALL_X2), density=1.0, friction=0.2, restitution=0.85),
+			userData   = ['B', id],
 		)
 
 
 class Paddle(Body):
 	def __init__(self, world: b2World, id: int, x: float, y: float, angle: float):
-		super(Paddle, self).__init__('Paddle', id, x, y)
+		super(Paddle, self).__init__('Paddle', id, x, y, angle)
 
-		self.angle = angle
-		self.body  = world.CreateDynamicBody(
-			allowSleep      = False,
-			bullet          = True,
-			# fixedRotation = True,
-			fixtures        = b2FixtureDef(shape=b2PolygonShape(box=(PADDLE_X2, PADDLE_Y2)), density=1.2, friction=0.3, restitution=1.0),
+		self.body = world.CreateDynamicBody(
+			allowSleep = False,
+			bullet     = True,
+			fixtures   = b2FixtureDef(shape=b2PolygonShape(box=(PADDLE_X2, PADDLE_Y2)), density=2.0, friction=0.3, restitution=0.3),
+			userData   = ['P', id],
 		)
 
 
@@ -131,15 +145,18 @@ class Pong(b2ContactListener):
 		self.port      = DefaultInt(kwargs.get('port'), 1234)
 		self.reconnect = DefaultInt(kwargs.get('reconnect'), 3)
 
-		self.connected = False
-		self.doneFrame = 0
-		self.frame     = 0
-		self.id        = -1
-		self.ideltas   = [0] * 4  # previous [pframe - iframe] deltas
-		self.iframe    = -1       # frame where prev Physics was simulated
-		self.pframe    = -1       # frame where current Physics was simulated
-		self.sdelta    = 0        # average of ideltas
-		self.start     = time()
+		self.ballDirty   = 0              # which balls must be sent via network (flag)
+		self.connected   = False
+		self.doneFrame   = 0
+		self.frame       = 0
+		self.hitFlag     = 0
+		self.id          = -1
+		self.ideltas     = [0] * 8        # previous [pframe - iframe] deltas
+		self.iframe      = -1             # frame where prev Physics was simulated
+		self.paddleDirty = 0              # which paddles must be sent via network (flag)
+		self.pframe      = -1             # frame where current Physics was simulated
+		self.sdelta      = 0              # average of ideltas
+		self.start       = time()
 
 		self.world                   = b2World(gravity=(0, 0), doSleep=True)
 		self.world.contactListener   = self
@@ -147,17 +164,17 @@ class Pong(b2ContactListener):
 		self.world.continuousPhysics = True
 		self.world.subStepping       = True
 
-		border = self.world.CreateStaticBody()
-		border.CreateLoopFixture(vertices=[(5, -5), (5, 5), (-5, 5), (-5, -5)])
+		border = self.world.CreateStaticBody(userData = ['W', 0])
+		border.CreateLoopFixture(vertices=[(ZONE_X2, -ZONE_X2), (ZONE_X2, ZONE_X2), (-ZONE_X2, ZONE_X2), (-ZONE_X2, -ZONE_X2)])
 
 		# create bodies
 		gap            = PADDLE_GAP
-		self.balls     = [Ball(self.world, 0, 0, 0)]
+		self.balls     = [Ball(self.world, 0, 0, 0, 0)]
 		self.paddles   = [
-			Paddle(self.world, 0, -ZONE_X2 + gap, 0             , 0     ),
-			Paddle(self.world, 1, ZONE_X2 - gap , 0             , 0     ),
-			Paddle(self.world, 2, 0             , -ZONE_Y2 + gap, pi / 2),
-			Paddle(self.world, 3, 0             , ZONE_Y2 - gap , pi / 2),
+			Paddle(self.world, 0, 0             , -ZONE_Y2 + gap, pi / 2),
+			Paddle(self.world, 1, 0             , ZONE_Y2 - gap , pi / 2),
+			Paddle(self.world, 2, -ZONE_X2 + gap, 0             , 0     ),
+			Paddle(self.world, 3, ZONE_X2 - gap , 0             , 0     ),
 		]
 
 	# NETWORK
@@ -172,10 +189,53 @@ class Pong(b2ContactListener):
 	# GAME
 	######
 
-	def AddBall(self):
-		ball = Ball(self.world, 0, 0, 0)
-		self.balls.append(ball)
-		self.ResetBall(ball)
+	def AddBall(self, number: int = 1):
+		for _ in range(number):
+			ball = Ball(self.world, len(self.balls), 0, 0, 0)
+			self.balls.append(ball)
+			self.ResetBall(ball)
+
+	def BeginContact(self, contact):
+		self.Contact(contact, False)
+
+	def Contact(self, contact, isEnd: bool):
+		bodyA      = contact.fixtureA.body
+		bodyB      = contact.fixtureB.body
+		nameA, idA = bodyA.userData
+		nameB, idB = bodyB.userData
+
+		if nameA == 'B':
+			self.ballDirty |= (1 << idA)
+			if nameB == 'B':
+				if not isEnd: self.hitFlag |= HIT_BALL_BALL
+				self.ballDirty |= (1 << idB)
+			elif nameB == 'P':
+				if not isEnd: self.hitFlag |= HIT_BALL_PADDLE
+				self.paddleDirty |= (1 << idB)
+			elif nameB == 'W':
+				if not isEnd: self.hitFlag |= HIT_BALL_WALL
+		#
+		elif nameA == 'P':
+			self.paddleDirty |= (1 << idA)
+			if nameB == 'B':
+				if not isEnd: self.hitFlag |= HIT_BALL_PADDLE
+				self.ballDirty |= (1 << idB)
+			elif nameB == 'P':
+				if not isEnd: self.hitFlag |= HIT_PADDLE_PADDLE
+				self.paddleDirty |= (1 << idB)
+			elif nameB == 'W':
+				if not isEnd: self.hitFlag |= HIT_PADDLE_WALL
+		#
+		elif nameA == 'W':
+			if nameB == 'B':
+				if not isEnd: self.hitFlag |= HIT_BALL_WALL
+				self.ballDirty |= (1 << idB)
+			elif nameB == 'P':
+				if not isEnd: self.hitFlag |= HIT_PADDLE_WALL
+				self.paddleDirty |= (1 << idB)
+
+	def EndContact(self, contact):
+		self.Contact(contact, True)
 
 	def Interpolate(self, interpolate: bool):
 		if not interpolate or self.sdelta < 1:
@@ -185,15 +245,24 @@ class Pong(b2ContactListener):
 				obj.position = body.position
 		else:
 			id = self.frame - self.pframe
-			# hack to make sure we avoid duplicate frames
-			if id == self.sdelta: self.sdelta += 1
 
 			if id == 0:
 				for obj in chain(self.balls, self.paddles):
 					obj.angle    = obj.angle1
 					obj.position = obj.position1
 			else:
-				v = id / self.sdelta
+				# hack to make sure we avoid duplicate frames
+				# 0.9 => 0.95 => 0.975 ...
+				if id >= self.sdelta:
+					id -= 1
+					v = (id / self.sdelta + 1) / 2
+
+					while id >= self.sdelta:
+						v = (v + 1) / 2
+						id -= 1
+				else:
+					v = id / self.sdelta
+
 				u = 1 - v
 
 				for obj in chain(self.balls, self.paddles):
@@ -210,19 +279,16 @@ class Pong(b2ContactListener):
 			obj.angle1    = body.angle
 			obj.position1 = (body.position[0], body.position[1])
 
-		for i in range(3):
-			self.ideltas[i] = self.ideltas[i + 1]
-		self.ideltas[3] = self.pframe - self.iframe
-		self.sdelta = int(sum(self.ideltas) / 4 + 0.5)
+		numDelta = len(self.ideltas)
+		for i in range(numDelta - 1): self.ideltas[i] = self.ideltas[i + 1]
+		self.ideltas[numDelta - 1] = self.pframe - self.iframe
+		self.sdelta = int(sum(self.ideltas) / numDelta + 0.5)
 
 		self.iframe = self.pframe
 
 	def NewGame(self):
-		for obj in chain(self.balls, self.paddles):
-			obj.Reset()
-
+		for obj in chain(self.balls, self.paddles): obj.Reset()
 		self.ResetBalls()
-		self.PrintBalls()
 
 		self.doneFrame = 0
 		self.frame     = 0
@@ -231,6 +297,19 @@ class Pong(b2ContactListener):
 		self.start     = time()
 
 	def Physics(self):
+		# move paddles back
+		for paddle in self.paddles:
+			body   = paddle.body
+			deltaX = (paddle.position0[0] - body.position[0]) if paddle.angle0 == 0 else 0
+			deltaY = (paddle.position0[1] - body.position[1]) if paddle.angle0 != 0 else 0
+			force  = (
+				-body.linearVelocity[0] * 1 + deltaX * 5,
+				-body.linearVelocity[1] * 1 + deltaY * 5
+			)
+			body.ApplyForceToCenter(force, True)
+			body.ApplyTorque((paddle.angle0 - body.angle) * 3 - body.angularVelocity * 0.4, True)
+
+		# run solver
 		self.world.Step(PHYSICS_STEP, PHYSICS_IT_VEL, PHYSICS_IT_POS)
 		self.world.ClearForces()
 		self.pframe = self.frame
@@ -238,6 +317,10 @@ class Pong(b2ContactListener):
 	def PhysicsLoop(self, interpolate: bool = False):
 		elapsed   = time() - self.start
 		wantFrame = elapsed * PHYSICS_FPS
+
+		self.ballDirty   = 0
+		self.hitFlag     = 0
+		self.paddleDirty = 0
 
 		if self.doneFrame < wantFrame:
 			if interpolate:
