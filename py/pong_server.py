@@ -14,8 +14,7 @@ from typing import List
 
 import pyuv
 
-from common import DefaultInt
-from pong_common import Body, Pong
+from pong_common import Body, Pong, STRUCT_BALL, STRUCT_PADDLE
 
 
 class PongServer(Pong):
@@ -87,18 +86,24 @@ class PongServer(Pong):
 		while len(data):
 			if data[0] == 0:
 				# 1) game
+				# ball
+				if data[1] == ord('B'):
+					bid = data[2]
+					if 0 <= bid < len(self.balls):
+						self.balls[bid].Parse(data[:STRUCT_BALL])
+						self.ballDirty |= (1 << bid)
+
+					data = data[STRUCT_BALL:]
+
 				# paddle
-				if data[1] == ord('P'):
+				elif data[1] == ord('P'):
 					pid = data[2]
 					if 0 <= pid < len(self.paddles):
-						message = data[:32]
+						message = data[:STRUCT_PADDLE]
 						self.paddles[pid].Parse(message)
+						self.paddleDirty |= (1 << pid)
 
-						for sid, slot in enumerate(self.slots):
-							if sid != pid and slot:
-								self.Send(slot, message)
-
-					data = data[32:]
+					data = data[STRUCT_PADDLE:]
 
 				# 2) connection
 				elif data[1] == ord('I'):
@@ -156,11 +161,14 @@ class PongServer(Pong):
 					break
 
 	def ShareObjects(self, objects: List[Body], flag: int, skipId: int = -1):
+		# if flag > 0: print('ShareObjects', flag, skipId)
+
 		for sid, slot in enumerate(self.slots):
 			if slot and sid != skipId:
 				for oid, obj in enumerate(objects):
-					if flag == -1 or (flag & (1 << oid)):
+					if obj.parentId != sid and (flag == -1 or (flag & (1 << oid))):
 						self.Send(slot, obj.Format())
+						# print(sid, obj.Format())
 
 	def Signal(self, handle: pyuv.Signal, signum: int):
 		for client in self.players:

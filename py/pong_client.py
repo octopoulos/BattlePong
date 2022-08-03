@@ -17,7 +17,8 @@ import pygame
 import pyuv
 
 from common import DefaultInt
-from pong_common import BALL_X2, PADDLE_HIT, PADDLE_IMPULSE, PADDLE_X2, PADDLE_Y2, Pong
+from pong_common import BALL_X2, PADDLE_HIT, PADDLE_IMPULSE, PADDLE_X2, PADDLE_Y2, Pong, STRUCT_BALL, STRUCT_PADDLE, \
+	SUN_RADIUS, WALL_THICKNESS, ZONE_X2
 from renderer_basic import Renderer, RendererBasic
 from renderer_opengl import RendererOpenGL
 
@@ -29,11 +30,12 @@ RENDERERS = {
 
 FONT_SIZE = 0.3
 
-ACTION_BALL_ADD   = 1
-ACTION_BALL_RESET = 2
-ACTION_GAME_EXIT  = 3
-ACTION_GAME_NEW   = 4
-ACTION_MOUSE_GRAB = 5
+ACTION_BALL_ADD    = 1
+ACTION_BALL_RESET  = 2
+ACTION_DEBUG_INPUT = 3
+ACTION_GAME_EXIT   = 4
+ACTION_GAME_NEW    = 5
+ACTION_MOUSE_GRAB  = 6
 
 # ps4 defaults
 AXIS_DEADZONE  = 0.1
@@ -103,10 +105,12 @@ class PongClient(Pong):
 		self.axes       = [0] * 6                                # axes values
 		self.client     = None                                   # type: pyuv.TCP
 		self.clock      = pygame.time.Clock()
+		self.debug      = 0                                      # &1: inputs
 		self.font       = None                                   # type: pygame.font.Font
 		self.fontSize   = 32
 		self.gamepad    = 0
 		self.grab       = True
+		self.hasMoved   = False
 		self.hit        = 0
 		self.keyActions = {}
 		self.keyButtons = {}
@@ -172,16 +176,16 @@ class PongClient(Pong):
 					bid = data[2]
 					while bid >= len(self.balls): self.AddBall()
 
-					self.balls[bid].Parse(data[:32])
+					self.balls[bid].Parse(data[:STRUCT_BALL])
 					self.doneFrame = 0
 					self.start     = time()
-					data           = data[32:]
+					data           = data[STRUCT_BALL:]
 
 				# paddle
 				elif data[1] == ord('P'):
 					pid = data[2]
-					if 0 <= pid < len(self.paddles): self.paddles[pid].Parse(data[:32])
-					data = data[32:]
+					if 0 <= pid < len(self.paddles): self.paddles[pid].Parse(data[:STRUCT_PADDLE])
+					data = data[STRUCT_PADDLE:]
 
 				# 2) connection
 				elif data[1] == ord('I'):
@@ -238,7 +242,7 @@ class PongClient(Pong):
 		axisY = min(max(axisY, -1), 1)
 
 		# 3) disconnected => move all paddles
-		if self.connected:
+		if self.id >= 0:
 			ids = [self.id]
 		else:
 			ids = [0, 1, 2, 3]
@@ -251,6 +255,7 @@ class PongClient(Pong):
 
 			# hitting the ball
 			if (pad & (BUTTON_SQUARE | BUTTON_L1)) or axes[AXIS_LTRIGGER] > -1:
+				self.hasMoved = True
 				value = (1 if (pad & (BUTTON_SQUARE | BUTTON_L1)) else (axes[AXIS_LTRIGGER] + 1) / 2) * PADDLE_HIT
 				if horiz:
 					if paddle.position0[1] < 0:
@@ -259,6 +264,7 @@ class PongClient(Pong):
 				elif body.angle > -pi / 16: body.ApplyAngularImpulse(-value, True)
 
 			if (pad & (BUTTON_CIRCLE | BUTTON_R1)) or axes[AXIS_RTRIGGER] > -1:
+				self.hasMoved = True
 				value = (1 if (pad & (BUTTON_CIRCLE | BUTTON_R1)) else (axes[AXIS_RTRIGGER] + 1) / 2) * PADDLE_HIT
 				if horiz:
 					if paddle.position0[1] < 0:
@@ -267,37 +273,73 @@ class PongClient(Pong):
 				elif body.angle < pi / 16: body.ApplyAngularImpulse(value, True)
 
 			# movement
-			if axisX and     horiz: body.ApplyLinearImpulse((PADDLE_IMPULSE * axisX, 0                      ), center, True)
-			if axisY and not horiz: body.ApplyLinearImpulse((0                     , -PADDLE_IMPULSE * axisY), center, True)
+			if axisX and horiz:
+				self.hasMoved = True
+				body.ApplyLinearImpulse((PADDLE_IMPULSE * axisX, 0), center, True)
+			if axisY and not horiz:
+				self.hasMoved = True
+				body.ApplyLinearImpulse((0, -PADDLE_IMPULSE * axisY), center, True)
 
 	def Draw(self):
 		self.screen.fill((80, 80, 80))
 
-		gap = self.fontSize * 1.125
-		for i, axis in enumerate(self.axes):
-			self.DrawText(self.size2, self.size2 + (i - 10.5) * gap, f'{i}: {axis:.3f}', (128, 128, 128))
-		for i in range(16):
-			self.DrawText(self.size2, self.size2 + (i - 4.5) * gap, f'{i}: {self.padFlag & (1 << i)}', (128, 128, 128))
+		scale = self.scale
+		size2 = self.size2
 
+		# walls
+		vertices  = self.wall.fixtures[0].shape.vertices
+		numVertex = len(vertices)
+
+		for i in range(numVertex - (numVertex & 1)):
+			x, y   = vertices[i]
+			x2, y2 = vertices[(i + 1) % numVertex]
+			if not self.frame: print(i, numVertex, (x, y), (x2, y2))
+			health = self.walls[i]
+			thick  = max(int(WALL_THICKNESS * scale), 2)
+			thick2 = max(int(thick / 4 + 0.5), 2)
+
+			self.renderer.DrawLine(
+				x * scale + size2 + (-thick2 if x == ZONE_X2 else 0),
+				-y * scale + size2 + (-thick2 if -y == ZONE_X2 else 0),
+				x2 * scale + size2 + (-thick2 if x2 == ZONE_X2 else 0),
+				-y2 * scale + size2 + (-thick2 if -y2 == ZONE_X2 else 0),
+				(240 - 40 * health, 80 + 120 * health, 0 + 240 * health) if health > 0 else (80, 80, 80),
+				thick
+			)
+
+		# sun
+		if self.sun:
+			x = self.sun.position[0] * scale + size2
+			y = self.sun.position[1] * scale + size2
+			self.renderer.DrawCircle(x, y, SUN_RADIUS * scale, self.sun.angle, (220, 110, 40), False)
+
+		# show pad inputs
+		if self.debug & 1:
+			gap = self.fontSize * 1.25
+			for i, axis in enumerate(self.axes):
+				self.DrawText(size2, size2 + (i - 10.5) * gap, f'{i}: {axis:.3f}', (128, 128, 128))
+			for i in range(16):
+				self.DrawText(size2, size2 + (i - 4.5) * gap, f'{i}: {self.padFlag & (1 << i)}', (128, 128, 128))
+
+		# paddles
 		for pid, paddle in enumerate(self.paddles):
 			if not paddle.alive: continue
 
-			self.DrawText(paddle.position0[0] * 1.08 * self.scale + self.size2, -paddle.position0[1] * 1.08 * self.scale + self.size2, f'{paddle.score}')
+			self.DrawText(paddle.position0[0] * 1.08 * scale + size2, -paddle.position0[1] * 1.08 * scale + size2, f'{paddle.score}')
 
 			# color = (0, 160, 255) if self.id == -1 or self.id != pid else (0, 255, 255)
 			color = PADDLE_COLORS[pid] if self.id == -1 or self.id != pid else (0, 255, 255)
-			x     = paddle.position[0] * self.scale + self.size2
-			y     = -paddle.position[1] * self.scale + self.size2
-			self.renderer.DrawQuad(x, y, PADDLE_X2 * self.scale, PADDLE_Y2 * self.scale, paddle.angle, color)
+			x     = paddle.position[0] * scale + size2
+			y     = -paddle.position[1] * scale + size2
+			self.renderer.DrawQuad(x, y, PADDLE_X2 * scale, PADDLE_Y2 * scale, paddle.angle, color)
 
+		# balls
 		for ball in self.balls:
 			if not ball.alive: continue
 
-			x = ball.position[0] * self.scale + self.size2
-			y = -ball.position[1] * self.scale + self.size2
-			# pygame.draw.circle(self.screen, (0, 255, 0), (x, y), BALL_X2)
-			# print(body)
-			self.renderer.DrawCircle(x, y, BALL_X2 * self.scale, ball.angle, (0, 255, 0))
+			x = ball.position[0] * scale + size2
+			y = -ball.position[1] * scale + size2
+			self.renderer.DrawCircle(x, y, BALL_X2 * scale, ball.angle, (0, 255, 0), True)
 
 	def DrawText(self, x: int, y: int, text: str, color: Tuple[int, int, int] = (200, 200, 200)):
 		textObj         = self.font.render(text, True, color)
@@ -308,12 +350,13 @@ class PongClient(Pong):
 	def GameKeyDown(self, key: int):
 		action = self.keyActions.get(key)
 
-		if action == ACTION_GAME_EXIT:    self.running = False
-		elif action == ACTION_BALL_ADD:   self.AddBall()
-		elif action == ACTION_BALL_RESET: self.ResetBalls()
-		elif action == ACTION_GAME_NEW:   self.NewGame()
-		elif action == ACTION_MOUSE_GRAB: self.Grab(False)
-		else:                             self.lastKey = key
+		if action == ACTION_GAME_EXIT:     self.running = False
+		elif action == ACTION_BALL_ADD:    self.AddBall()
+		elif action == ACTION_BALL_RESET:  self.ResetBalls()
+		elif action == ACTION_DEBUG_INPUT: self.debug ^= 1
+		elif action == ACTION_GAME_NEW:    self.NewGame()
+		elif action == ACTION_MOUSE_GRAB:  self.Grab(False)
+		else:                              self.lastKey = key
 
 		self.keys[key] = self.frame
 		self.keyFlag |= self.keyButtons.get(key, 0)
@@ -323,6 +366,10 @@ class PongClient(Pong):
 		self.keyFlag &= ~self.keyButtons.get(key, 0)
 
 	def GamePadInit(self):
+		if not pygame.joystick.get_count():
+			self.gamepad = None
+			return
+
 		self.gamepad = pygame.joystick.Joystick(0)
 		self.gamepad.init()
 
@@ -336,6 +383,8 @@ class PongClient(Pong):
 		print(self.gamepad.get_name(), self.gamepad.get_guid(), self.padAxes, self.padPads)
 
 	def GamePadUpdate(self):
+		if not self.gamepad: return
+
 		for i in range(self.gamepad.get_numbuttons()):
 			flag = 1 << self.padPads[i]
 			if self.gamepad.get_button(i):
@@ -363,6 +412,7 @@ class PongClient(Pong):
 			pygame.K_F1:     ACTION_BALL_ADD,
 			pygame.K_F2:     ACTION_BALL_RESET,
 			pygame.K_F3:     ACTION_GAME_NEW,
+			pygame.K_F4:     ACTION_DEBUG_INPUT,
 			pygame.K_TAB:    ACTION_MOUSE_GRAB,
 		}
 
@@ -410,18 +460,24 @@ class PongClient(Pong):
 			if self.hitFlag & (1 << i): self.PlaySound(i)
 
 	def Sync(self):
-		if self.mouseAbs[0] != self.mousePrev[0] or self.mouseAbs[1] != self.mousePrev[1]:
+		if self.id < 0: return
+
+		if self.hasMoved or (self.paddleDirty & (1 << self.id)):
 			paddle = self.paddles[self.id]
 			self.Send(self.client, paddle.Format())
-			self.mousePrev[0] = self.mouseAbs[0]
-			self.mousePrev[1] = self.mouseAbs[1]
+
+		if self.ballDirty:
+			for ball in self.balls:
+				if ball.parentId == self.id:
+					self.Send(self.client, ball.Format())
+
+		self.hasMoved = False
 
 	# MAIN LOOP
 	###########
 
 	def Run(self):
 		pygame.init()
-		pygame.joystick.init()
 		pygame.mixer.init()
 
 		self.fontSize = (int(FONT_SIZE * self.scale) // 8) * 8
@@ -441,7 +497,7 @@ class PongClient(Pong):
 
 		self.Grab(True)
 		self.NewGame()
-		self.AddBall(2)
+		# self.AddBall(2)
 
 		connectTime = 0
 
@@ -460,9 +516,11 @@ class PongClient(Pong):
 			events = pygame.event.get()
 			for event in events:
 				type_ = event.type
-				if type_ == pygame.QUIT:              self.running = False
-				elif type_ == pygame.KEYDOWN:         self.GameKeyDown(event.key)
-				elif type_ == pygame.KEYUP:           self.GameKeyUp(event.key)
+				if type_ == pygame.QUIT:               self.running = False
+				elif type_ == pygame.JOYDEVICEADDED:   self.GamePadInit()
+				elif type_ == pygame.JOYDEVICEREMOVED: self.GamePadInit()
+				elif type_ == pygame.KEYDOWN:          self.GameKeyDown(event.key)
+				elif type_ == pygame.KEYUP:            self.GameKeyUp(event.key)
 				elif type_ == pygame.MOUSEBUTTONDOWN:
 					if event.button == 1: self.GameKeyDown(pygame.K_q)
 					elif event.button == 3: self.GameKeyDown(pygame.K_e)

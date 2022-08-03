@@ -12,7 +12,6 @@ from math import cos, pi, sin
 from random import random
 import struct
 from time import time
-from typing import List
 
 from Box2D import b2CircleShape, b2ContactListener, b2FixtureDef, b2PolygonShape, b2World
 import pyuv
@@ -23,6 +22,7 @@ VERSION = '2022-08-01'
 
 # game
 BALL_ANGLE     = 0.3       # min starting throw angle
+BALL_ORBIT     = 1.5       # starting orbit
 BALL_SPEED_MAX = 20
 BALL_SPEED_MED = 15
 BALL_SPEED_MIN = 7
@@ -39,9 +39,9 @@ PADDLE_Y       = 1.28
 PHYSICS_FPS    = 120
 PHYSICS_IT_POS = 3         # number of position iterations
 PHYSICS_IT_VEL = 8         # number of velocity iterations
-SCALE          = 100
-SCREEN_X       = 1000
-SCREEN_Y       = 1000
+SUN_RADIUS     = 0.2
+WALL_SUBDIVIDE = 16
+WALL_THICKNESS = 0.08
 ZONE_X2        = 6
 ZONE_Y2        = 6
 
@@ -52,8 +52,6 @@ BALL_Y2         = BALL_Y / 2
 PADDLE_X2       = PADDLE_X / 2
 PADDLE_Y2       = PADDLE_Y / 2
 PHYSICS_STEP    = 1 / PHYSICS_FPS
-SCREEN_X2       = SCREEN_X // 2
-SCREEN_Y2       = SCREEN_Y // 2
 
 # hits
 HIT_BALL_BALL     = 1 << 0
@@ -61,6 +59,10 @@ HIT_BALL_PADDLE   = 1 << 1
 HIT_BALL_WALL     = 1 << 2
 HIT_PADDLE_PADDLE = 1 << 3
 HIT_PADDLE_WALL   = 1 << 4
+
+STRUCT_BALL    = 29
+STRUCT_DEFAULT = 28
+STRUCT_PADDLE  = 36
 
 
 class Body:
@@ -75,6 +77,8 @@ class Body:
 		self.position  = (x, y)           # interpolated position
 		self.position0 = (x, y)           # initial position
 		self.position1 = (x, y)           # prev position
+		self.buttons   = 0                # buttons can be used for prediction
+		self.parentId  = -1               # hit by ... -1 if nothing
 		self.score     = 0
 		self.body      = None
 
@@ -82,18 +86,17 @@ class Body:
 		body = self.body
 		pos  = body.position
 		vel  = body.linearVelocity
-		return f'<{self.name}: id={self.id} alive={self.alive} pos=({pos[0]},{pos[1]}) vel=({vel[0]},{vel[1]}) rot={body.angle} rotVel={body.angularVelocity}>'
+		return f'<{self.name}: id={self.id} alive={self.alive} pos=({pos[0]},{pos[1]}) vel=({vel[0]},{vel[1]}) rot={body.angle} rotVel={body.angularVelocity} buttons={self.buttons} parentId={self.parentId} score={self.score}>'
 
 	def Format(self) -> bytes:
 		body = self.body
 		pos  = body.position
 		vel  = body.linearVelocity
-		return struct.pack('xBBBffffffi', self.letter, self.id, self.alive, pos[0], pos[1], vel[0], vel[1], body.angle, body.angularVelocity, self.score)
+		return struct.pack('xBBBffffff', self.letter, self.id, self.alive, pos[0], pos[1], vel[0], vel[1], body.angle, body.angularVelocity)
 
 	def Parse(self, message: bytes) -> bool:
 		body = self.body
-		_, _, self.alive, posx, posy, velx, vely, body.angle, body.angularVelocity, self.score = struct.unpack('xBBBffffffi', message)
-
+		_, _, self.alive, posx, posy, velx, vely, body.angle, body.angularVelocity = struct.unpack('xBBBffffff', message)
 		body.position       = (posx, posy)
 		body.linearVelocity = (velx, vely)
 		return True
@@ -118,21 +121,48 @@ class Ball(Body):
 		self.body = world.CreateDynamicBody(
 			allowSleep = False,
 			bullet     = True,
-			fixtures   = b2FixtureDef(shape=b2CircleShape(radius=BALL_X2), density=1.0, friction=0.2, restitution=0.85),
-			userData   = ['B', id],
+			fixtures   = b2FixtureDef(shape=b2CircleShape(radius=BALL_X2), density=1.0, friction=0.2, restitution=0.95),
+			userData   = ['B', id, self],
 		)
+
+	def Format(self) -> bytes:
+		body = self.body
+		pos  = body.position
+		vel  = body.linearVelocity
+		return struct.pack('xBBBffffffb', self.letter, self.id, self.alive, pos[0], pos[1], vel[0], vel[1], body.angle, body.angularVelocity, self.parentId)
+
+	def Parse(self, message: bytes) -> bool:
+		body = self.body
+		_, _, self.alive, posx, posy, velx, vely, body.angle, body.angularVelocity, self.parentId = struct.unpack('xBBBffffffb', message)
+		body.position       = (posx, posy)
+		body.linearVelocity = (velx, vely)
+		return True
 
 
 class Paddle(Body):
 	def __init__(self, world: b2World, id: int, x: float, y: float, angle: float):
 		super(Paddle, self).__init__('Paddle', id, x, y, angle)
+		self.parentId = id
 
 		self.body = world.CreateDynamicBody(
 			allowSleep = False,
 			bullet     = True,
 			fixtures   = b2FixtureDef(shape=b2PolygonShape(box=(PADDLE_X2, PADDLE_Y2)), density=2.0, friction=0.3, restitution=0.3),
-			userData   = ['P', id],
+			userData   = ['P', id, self],
 		)
+
+	def Format(self) -> bytes:
+		body = self.body
+		pos  = body.position
+		vel  = body.linearVelocity
+		return struct.pack('xBBBffffffii', self.letter, self.id, self.alive, pos[0], pos[1], vel[0], vel[1], body.angle, body.angularVelocity, self.buttons, self.score)
+
+	def Parse(self, message: bytes) -> bool:
+		body = self.body
+		_, _, self.alive, posx, posy, velx, vely, body.angle, body.angularVelocity, self.buttons, self.score = struct.unpack('xBBBffffffii', message)
+		body.position       = (posx, posy)
+		body.linearVelocity = (velx, vely)
+		return True
 
 
 class Pong(b2ContactListener):
@@ -157,6 +187,7 @@ class Pong(b2ContactListener):
 		self.pframe      = -1             # frame where current Physics was simulated
 		self.sdelta      = 0              # average of ideltas
 		self.start       = time()
+		self.walls       = [1] * 16       # wall energy
 
 		self.world                   = b2World(gravity=(0, 0), doSleep=True)
 		self.world.contactListener   = self
@@ -164,18 +195,23 @@ class Pong(b2ContactListener):
 		self.world.continuousPhysics = True
 		self.world.subStepping       = True
 
-		border = self.world.CreateStaticBody(userData = ['W', 0])
-		border.CreateLoopFixture(vertices=[(ZONE_X2, -ZONE_X2), (ZONE_X2, ZONE_X2), (-ZONE_X2, ZONE_X2), (-ZONE_X2, -ZONE_X2)])
-
 		# create bodies
-		gap            = PADDLE_GAP
-		self.balls     = [Ball(self.world, 0, 0, 0, 0)]
-		self.paddles   = [
-			Paddle(self.world, 0, 0             , -ZONE_Y2 + gap, pi / 2),
-			Paddle(self.world, 1, 0             , ZONE_Y2 - gap , pi / 2),
-			Paddle(self.world, 2, -ZONE_X2 + gap, 0             , 0     ),
-			Paddle(self.world, 3, ZONE_X2 - gap , 0             , 0     ),
+		self.wall = self.world.CreateStaticBody(userData=['W', 0, None])
+		self.CreateWalls(WALL_SUBDIVIDE)
+
+		self.sun = self.world.CreateStaticBody(
+			fixtures = b2FixtureDef(shape=b2CircleShape(radius=SUN_RADIUS), density=5.0),
+			position = (0, 0),
+			userData = ['S', 0, None],
+		)
+
+		self.paddles = [
+			Paddle(self.world, 0, 0                    , -ZONE_Y2 + PADDLE_GAP, pi / 2),
+			Paddle(self.world, 1, -ZONE_X2 + PADDLE_GAP, 0                    , 0     ),
+			Paddle(self.world, 2, 0                    , ZONE_Y2 - PADDLE_GAP , pi / 2),
+			Paddle(self.world, 3, ZONE_X2 - PADDLE_GAP , 0                    , 0     ),
 		]
+		self.balls = [Ball(self.world, 0, 0, 0, 0)]
 
 	# NETWORK
 	#########
@@ -199,10 +235,10 @@ class Pong(b2ContactListener):
 		self.Contact(contact, False)
 
 	def Contact(self, contact, isEnd: bool):
-		bodyA      = contact.fixtureA.body
-		bodyB      = contact.fixtureB.body
-		nameA, idA = bodyA.userData
-		nameB, idB = bodyB.userData
+		bodyA         = contact.fixtureA.body
+		bodyB         = contact.fixtureB.body
+		nameA, idA, A = bodyA.userData
+		nameB, idB, B = bodyB.userData
 
 		if nameA == 'B':
 			self.ballDirty |= (1 << idA)
@@ -212,27 +248,67 @@ class Pong(b2ContactListener):
 			elif nameB == 'P':
 				if not isEnd: self.hitFlag |= HIT_BALL_PADDLE
 				self.paddleDirty |= (1 << idB)
+				A.parentId = idB
+			elif nameB == 'S':
+				self.ballDirty |= (1 << idB)
+				A.score = -1
 			elif nameB == 'W':
 				if not isEnd: self.hitFlag |= HIT_BALL_WALL
+				if A.parentId >= 0:
+					self.paddles[A.parentId].score += 1
+					A.parentId = -1
 		#
 		elif nameA == 'P':
 			self.paddleDirty |= (1 << idA)
 			if nameB == 'B':
 				if not isEnd: self.hitFlag |= HIT_BALL_PADDLE
 				self.ballDirty |= (1 << idB)
+				B.parentId = idA
 			elif nameB == 'P':
 				if not isEnd: self.hitFlag |= HIT_PADDLE_PADDLE
 				self.paddleDirty |= (1 << idB)
 			elif nameB == 'W':
 				if not isEnd: self.hitFlag |= HIT_PADDLE_WALL
 		#
+		elif nameA == 'S':
+			if nameB == 'B':
+				self.ballDirty |= (1 << idA)
+				B.score = -1
+		#
 		elif nameA == 'W':
 			if nameB == 'B':
-				if not isEnd: self.hitFlag |= HIT_BALL_WALL
+				childId = contact.childIndexA
+				wallId  = childId // WALL_SUBDIVIDE
+				if not isEnd:
+					self.hitFlag |= HIT_BALL_WALL
+					self.paddles[wallId].score -= 1
+					if self.walls[childId] > 0: self.walls[childId] -= 0.25
+
 				self.ballDirty |= (1 << idB)
+				if B.parentId >= 0:
+					if wallId != B.parentId: self.paddles[B.parentId].score += 1
+					B.parentId = -1
 			elif nameB == 'P':
 				if not isEnd: self.hitFlag |= HIT_PADDLE_WALL
 				self.paddleDirty |= (1 << idB)
+
+	def CreateWalls(self, numDiv: int):
+		numDiv   = min(max(numDiv, 0), 64)
+		segments = [(ZONE_X2, -ZONE_X2), (-ZONE_X2, -ZONE_X2), (-ZONE_X2, ZONE_X2), (ZONE_X2, ZONE_X2)]
+
+		if numDiv > 0:
+			vertices = []
+			for i in range(4):
+				x, y   = segments[i]
+				x2, y2 = segments[(i + 1) % 4]
+				dx     = (x2 - x) / numDiv
+				dy     = (y2 - y) / numDiv
+				for j in range(numDiv): vertices.append((x + dx * j, y + dy * j))
+		else:
+			vertices = segments
+
+		self.wall.CreateLoopFixture(vertices=vertices)
+		self.walls = [1] * (len(vertices) + 1)
 
 	def EndContact(self, contact):
 		self.Contact(contact, True)
@@ -290,6 +366,8 @@ class Pong(b2ContactListener):
 		for obj in chain(self.balls, self.paddles): obj.Reset()
 		self.ResetBalls()
 
+		for i in range(len(self.walls)): self.walls[i] = 1
+
 		self.doneFrame = 0
 		self.frame     = 0
 		self.iframe    = -1
@@ -297,6 +375,21 @@ class Pong(b2ContactListener):
 		self.start     = time()
 
 	def Physics(self):
+		# sun gravity
+		for ball in self.balls:
+			body   = ball.body
+			pos    = body.position
+			grav   = 0.02 / (pos[0] * pos[0] + pos[1] * pos[1] + 0.1)
+			hitSun = (ball.score == -1)
+			if hitSun:
+				grav = -grav * 10 - 5
+				ball.score = 0
+			force = (
+				-pos[0] * grav,
+				-pos[1] * grav,
+			)
+			body.ApplyForceToCenter(force, True)
+
 		# move paddles back
 		for paddle in self.paddles:
 			body   = paddle.body
@@ -333,19 +426,19 @@ class Pong(b2ContactListener):
 
 		self.Interpolate(interpolate)
 
-	def PrintBalls(self):
-		for bid, ball in enumerate(self.balls):
-			print(bid, ball)
-
-	def ResetBall(self, ball: List):
+	def ResetBall(self, ball: Ball, recenter: bool = True):
 		# angle between 0 + eps and PI/2 - eps
-		angle   = BALL_ANGLE + (pi / 2 - BALL_ANGLE * 2) * random()
-		speed   = BALL_SPEED_MIN + random() * (BALL_SPEED_MED - BALL_SPEED_MIN)
+		angle = BALL_ANGLE + (pi / 2 - BALL_ANGLE * 2) * random()
+		speed = BALL_SPEED_MIN + random() * (BALL_SPEED_MED - BALL_SPEED_MIN)
+
+		if recenter:
+			alpha         = ball.id * 2 * pi / len(self.balls)
+			body          = ball.body
+			body.position = (BALL_ORBIT * cos(alpha), BALL_ORBIT * sin(alpha))
 
 		body                = ball.body
 		ball.alive          = 1
 		body.linearVelocity = (speed * cos(angle) * (1 if random() > 0.5 else -1), speed * sin(angle) * (1 if random() > 0.5 else -1))
 
-	def ResetBalls(self):
-		for ball in self.balls:
-			self.ResetBall(ball)
+	def ResetBalls(self, recenter: bool = True):
+		for ball in self.balls: self.ResetBall(ball, recenter)
