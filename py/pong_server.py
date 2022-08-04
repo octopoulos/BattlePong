@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-08-01
+# @version 2022-08-02
 
 """
 Pong server
@@ -14,7 +14,7 @@ from typing import List
 
 import pyuv
 
-from pong_common import Body, Pong, STRUCT_BALL, STRUCT_PADDLE
+from pong_common import Ball, Body, Paddle, Pong
 
 
 class PongServer(Pong):
@@ -90,20 +90,20 @@ class PongServer(Pong):
 				if data[1] == ord('B'):
 					bid = data[2]
 					if 0 <= bid < len(self.balls):
-						self.balls[bid].Parse(data[:STRUCT_BALL])
+						self.balls[bid].Parse(data[:Ball.structSize])
 						self.ballDirty |= (1 << bid)
 
-					data = data[STRUCT_BALL:]
+					data = data[Ball.structSize:]
 
 				# paddle
 				elif data[1] == ord('P'):
 					pid = data[2]
 					if 0 <= pid < len(self.paddles):
-						message = data[:STRUCT_PADDLE]
+						message = data[:Paddle.structSize]
 						self.paddles[pid].Parse(message)
 						self.paddleDirty |= (1 << pid)
 
-					data = data[STRUCT_PADDLE:]
+					data = data[Paddle.structSize:]
 
 				# 2) connection
 				elif data[1] == ord('I'):
@@ -184,8 +184,8 @@ class PongServer(Pong):
 	# GAME
 	######
 
-	def NewGame(self):
-		super(PongServer, self).NewGame()
+	def NewGame(self, numDiv: int = 0):
+		super(PongServer, self).NewGame(numDiv)
 
 		for slot in self.slots:
 			if slot and (player := self.players.get(slot)):

@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-08-01
+# @version 2022-08-02
 
 """
 Pong client
@@ -18,8 +18,8 @@ import pygame
 import pyuv
 
 from common import DefaultInt
-from pong_common import BALL_X2, PADDLE_FAR2, PADDLE_HIT, PADDLE_IMPULSE, PADDLE_NEAR2, PADDLE_X2, PADDLE_Y2, Pong, \
-	STRUCT_BALL, STRUCT_PADDLE, SUN_RADIUS, WALL_THICKNESS, ZONE_X2
+from pong_common import Ball, BALL_X2, Paddle, PADDLE_FAR2, PADDLE_HIT, PADDLE_IMPULSE, PADDLE_NEAR2, PADDLE_X2, \
+	PADDLE_Y2, Pong, SUN_RADIUS, WALL_THICKNESS, ZONE_X2, ZONE_Y2
 from renderer_basic import Renderer, RendererBasic
 from renderer_opengl import RendererOpenGL
 
@@ -29,18 +29,26 @@ RENDERERS = {
 	'opengl': RendererOpenGL,
 }
 
-ACTION_BALL_ADD    = 1
-ACTION_BALL_DELETE = 2
-ACTION_BALL_RESET  = 3
-ACTION_DEBUG_INPUT = 4
-ACTION_GAME_AI     = 5
-ACTION_GAME_EXIT   = 6
-ACTION_GAME_NEW    = 7
-ACTION_GAME_START  = 8
-ACTION_GAME_STOP   = 9
-ACTION_MOUSE_GRAB  = 10
+ACTION_BALL_1      = 1
+ACTION_BALL_2      = 2
+ACTION_BALL_3      = 3
+ACTION_BALL_4      = 4
+ACTION_BALL_ADD    = 5
+ACTION_BALL_DELETE = 6
+ACTION_BALL_RESET  = 7
+ACTION_DEBUG_INPUT = 8
+ACTION_EXIT        = 9
+ACTION_GAME_AI     = 10
+ACTION_GAME_NEW1   = 11
+ACTION_GAME_NEW2   = 12
+ACTION_GAME_NEW4   = 13
+ACTION_GAME_NEW8   = 14
+ACTION_MOUSE_GRAB  = 15
+ACTION_PAUSE       = 16
+ACTION_PAUSE_STEP  = 17
 
 # ps4 defaults
+AXES_ZERO      = [0, 0, 0, 0, -1, -1]
 AXIS_DEADZONE  = 0.1
 AXIS_THRESHOLD = 0.92
 AXIS_X1        = 0
@@ -70,6 +78,16 @@ BUTTON_TOUCH    = 1 << 15
 NAME_PADS = {
 	'PS4 Controller': [None, None],
 }
+
+BALL_COLORS = (
+	(0  , 220, 0  ),
+	(0  , 0  , 255),
+	(255, 0  , 0  ),
+	(255, 255, 0  ),
+	(0  , 255, 255),
+	(255, 0  , 255),
+	(255, 255, 255),
+)
 
 PADDLE_COLORS = (
 	(255, 200, 0  ),
@@ -111,7 +129,7 @@ class PongClient(Pong):
 
 		self.actions      = {}
 		self.aiControl    = 0                                      # AI plays for the player
-		self.axes         = [0] * 6                                # axes values
+		self.axes         = AXES_ZERO[:]                           # axes values
 		self.client       = None                                   # type: pyuv.TCP
 		self.clock        = pygame.time.Clock()
 		self.debug        = 0                                      # &1: inputs
@@ -129,9 +147,11 @@ class PongClient(Pong):
 		self.mouseAbs     = [self.size2, self.size2]
 		self.mouseButtons = {}
 		self.mousePos     = [self.size2, self.size2]
+		self.nextPause    = 0
 		self.padAxes      = list(range(6))                         # axis mapping
 		self.padButtons   = list(range(16))                        # button mapping
 		self.padFlag      = 0                                      # actions pushed, from gamepad
+		self.paused       = 0
 		self.randAngle    = [0.5, 0.0]                             # decide to rotate
 		self.randMove     = [0.5, 0.0]                             # decide edge or center
 		self.renderer     = None                                   # type: Renderer
@@ -155,7 +175,7 @@ class PongClient(Pong):
 
 	def UpdateTitle(self):
 		status = 'CONN' if self.connected else 'DISC'
-		pygame.display.set_caption(f'[{status}] id={self.id} x={self.mouseAbs[0]} y={self.mouseAbs[1]} key={self.lastKey} fps={self.clock.get_fps():.1f}')
+		pygame.display.set_caption(f'BattlePong [{status}] div={self.numDiv} ai={self.aiControl} id={self.id} key={self.lastKey} fps={self.clock.get_fps():.1f}')
 
 	# NETWORK
 	#########
@@ -185,16 +205,16 @@ class PongClient(Pong):
 					bid = data[2]
 					while bid >= len(self.balls): self.AddBall()
 
-					self.balls[bid].Parse(data[:STRUCT_BALL])
+					self.balls[bid].Parse(data[:Ball.structSize])
 					self.doneFrame = 0
 					self.start     = time()
-					data           = data[STRUCT_BALL:]
+					data           = data[Ball.structSize:]
 
 				# paddle
 				elif data[1] == ord('P'):
 					pid = data[2]
-					if 0 <= pid < len(self.paddles): self.paddles[pid].Parse(data[:STRUCT_PADDLE])
-					data = data[STRUCT_PADDLE:]
+					if 0 <= pid < len(self.paddles): self.paddles[pid].Parse(data[:Paddle.structSize])
+					data = data[Paddle.structSize:]
 
 				# 2) connection
 				elif data[1] == ord('I'):
@@ -218,18 +238,49 @@ class PongClient(Pong):
 	######
 
 	def AiControls(self, id: int) -> Tuple[List[float], int]:
-		paddle  = self.paddles[id]
+		paddle = self.paddles[id]
+		if not paddle.alive: return AXES_ZERO, 0
+
+		# 1) find closest ball
+		horiz   = 1 if paddle.angle0 > 0 else 0
 		pbody   = paddle.body
 		ppos    = pbody.position
-		ball    = self.balls[0]
-		bbody   = ball.body
-		bpos    = bbody.position
+		best    = self.balls[0]
+		bestDot = 1000
+
+		if len(self.balls) > 0:
+			best = None
+
+			for ball in self.balls:
+				bbody   = ball.body
+				bpos    = bbody.position
+				bvel    = bbody.linearVelocity
+				ballDot = 1000
+
+				# ball is coming towards us?
+				dx0  = bpos[0] - paddle.position0[0]
+				dy0  = bpos[1] - paddle.position0[1]
+				# dots = []
+				for i in range(5):
+					dx1     = dx0 if horiz == 0 else dx0 - (i - 2) * ZONE_X2
+					dy1     = dy0 if horiz == 1 else dy0 - (i - 2) * ZONE_Y2
+					dist2   = dx1 * dx1 + dy1 * dy1 + 0.1
+					dot     = (dx1 * bvel[0] + dy1 * bvel[1]) / dist2
+					ballDot = min(ballDot, dot)
+					# dots.append(int(dot * 100) / 100)
+
+				if ballDot < 0 and ballDot < bestDot:
+					best    = ball
+					bestDot = ballDot
+				# print(f'bid={ball.id} bdot={ballDot:.2f} best={bestDot:.2f} {best.id if best else "X"}', dots)
+
+		# 2) move
+		bpos    = best.body.position if best else paddle.position0
 		dx      = bpos[0] - ppos[0]
 		dy      = bpos[1] - ppos[1]
 		dist2   = dx * dx + dy * dy
 		buttons = 0
 
-		# 1) move
 		randMove = self.RandomDecision(self.randMove, TIMEOUT_MOVE) - 0.5
 
 		if paddle.angle0 > 0:
@@ -255,12 +306,12 @@ class PongClient(Pong):
 			if dy > 0:   buttons |= BUTTON_UP
 			elif dy < 0: buttons |= BUTTON_DOWN
 
-		# 2) rotate hit?
+		# 3) rotate hit?
 		if dist2 < PADDLE_NEAR2:
 			randAngle = self.RandomDecision(self.randAngle, TIMEOUT_ANGLE)
 			buttons |= (BUTTON_L1 if randAngle > 0.5 else BUTTON_R1)
 
-		return [0] * 6, buttons
+		return AXES_ZERO, buttons
 
 	def Controls(self):
 		self.GamePadUpdate()
@@ -276,6 +327,9 @@ class PongClient(Pong):
 			ids = [0, 1, 2, 3]
 
 		for id in ids:
+			paddle = self.paddles[id]
+			if not paddle.alive: continue
+
 			# 2) gamepad + keyboard + AI inputs
 			if id != max(0, self.id):
 				axes, pad = self.AiControls(id)
@@ -296,7 +350,6 @@ class PongClient(Pong):
 			axisY = min(max(axisY, -1), 1)
 
 			# 3) apply inputs
-			paddle = self.paddles[id]
 			horiz  = paddle.angle0 > 0
 			body   = paddle.body
 			center = body.worldCenter
@@ -307,18 +360,18 @@ class PongClient(Pong):
 				value = (1 if (pad & (BUTTON_SQUARE | BUTTON_L1)) else (axes[AXIS_LTRIGGER] + 1) / 2) * PADDLE_HIT
 				if horiz:
 					if paddle.position0[1] < 0:
-						if body.angle > pi / 2 - pi / 16: body.ApplyAngularImpulse(-value, True)
-					elif body.angle < pi / 2 + pi / 16: body.ApplyAngularImpulse(value, True)
-				elif body.angle > -pi / 16: body.ApplyAngularImpulse(-value, True)
+						if body.angle < pi / 2 + pi / 16: body.ApplyAngularImpulse(value, True)
+					elif body.angle > pi / 2 - pi / 16: body.ApplyAngularImpulse(-value, True)
+				elif body.angle < pi / 16: body.ApplyAngularImpulse(value, True)
 
 			if (pad & (BUTTON_CIRCLE | BUTTON_R1)) or axes[AXIS_RTRIGGER] > -1:
 				self.hasMoved = True
 				value = (1 if (pad & (BUTTON_CIRCLE | BUTTON_R1)) else (axes[AXIS_RTRIGGER] + 1) / 2) * PADDLE_HIT
 				if horiz:
 					if paddle.position0[1] < 0:
-						if body.angle < pi / 2 + pi / 16: body.ApplyAngularImpulse(value, True)
-					elif body.angle > pi / 2 - pi / 16: body.ApplyAngularImpulse(-value, True)
-				elif body.angle < pi / 16: body.ApplyAngularImpulse(value, True)
+						if body.angle > pi / 2 - pi / 16: body.ApplyAngularImpulse(-value, True)
+					elif body.angle < pi / 2 + pi / 16: body.ApplyAngularImpulse(value, True)
+				elif body.angle > -pi / 16: body.ApplyAngularImpulse(-value, True)
 
 			# movement
 			if axisX and horiz:
@@ -331,7 +384,7 @@ class PongClient(Pong):
 			paddle.buttons = pad
 
 	def Draw(self):
-		self.screen.fill((80, 80, 80))
+		self.screen.fill((40, 40, 40))
 
 		scale = self.scale
 		size2 = self.size2
@@ -353,7 +406,7 @@ class PongClient(Pong):
 				-y * scale + size2 + (-thick2 if -y == ZONE_X2 else 0),
 				x2 * scale + size2 + (-thick2 if x2 == ZONE_X2 else 0),
 				-y2 * scale + size2 + (-thick2 if -y2 == ZONE_X2 else 0),
-				(240 - 40 * health, 80 + 120 * health, 0 + 240 * health) if health > 0 else (80, 80, 80),
+				(240 - 40 * health, 50 + 150 * health, 0 + 240 * health) if health > 0 else (40, 40, 40),
 				thick
 			)
 
@@ -379,23 +432,24 @@ class PongClient(Pong):
 
 		# paddles
 		for pid, paddle in enumerate(self.paddles):
-			if not paddle.alive: continue
-
 			self.DrawText(paddle.position0[0] * 1.08 * scale + size2, -paddle.position0[1] * 1.08 * scale + size2, f'{paddle.score}')
 
-			# color = (0, 160, 255) if self.id == -1 or self.id != pid else (0, 255, 255)
 			color = PADDLE_COLORS[pid] if self.id == -1 or self.id != pid else (0, 255, 255)
-			x     = paddle.position[0] * scale + size2
-			y     = -paddle.position[1] * scale + size2
+			if not paddle.alive: color = (80 + color[0] * 0.1, 80 + color[1] * 0.1, 80 + color[2] * 0.1)
+
+			x = paddle.position[0] * scale + size2
+			y = -paddle.position[1] * scale + size2
 			self.renderer.DrawQuad(x, y, PADDLE_X2 * scale, PADDLE_Y2 * scale, paddle.angle, color)
 
 		# balls
-		for ball in self.balls:
+		numColor = len(BALL_COLORS)
+		for bid, ball in enumerate(self.balls):
 			if not ball.alive: continue
 
-			x = ball.position[0] * scale + size2
-			y = -ball.position[1] * scale + size2
-			self.renderer.DrawCircle(x, y, BALL_X2 * scale, ball.angle, (0, 255, 0), True)
+			color = BALL_COLORS[bid % numColor]
+			x     = ball.position[0] * scale + size2
+			y     = -ball.position[1] * scale + size2
+			self.renderer.DrawCircle(x, y, BALL_X2 * scale, ball.angle, color, True)
 
 	def DrawText(self, x: int, y: int, text: str, color: Tuple[int, int, int] = (200, 200, 200)):
 		textObj         = self.font.render(text, True, color)
@@ -406,16 +460,23 @@ class PongClient(Pong):
 	def GameKeyDown(self, key: int):
 		action = self.keyActions.get(key)
 
-		if action == ACTION_GAME_EXIT:     self.running = False
+		if action == ACTION_EXIT:          self.running = False
+		elif action == ACTION_BALL_1:      self.SetBalls(1)
+		elif action == ACTION_BALL_2:      self.SetBalls(2)
+		elif action == ACTION_BALL_3:      self.SetBalls(3)
+		elif action == ACTION_BALL_4:      self.SetBalls(4)
 		elif action == ACTION_BALL_ADD:    self.AddBall()
 		elif action == ACTION_BALL_DELETE: self.DeleteBall()
 		elif action == ACTION_BALL_RESET:  self.ResetBalls()
 		elif action == ACTION_DEBUG_INPUT: self.debug ^= 1
 		elif action == ACTION_GAME_AI:     self.aiControl ^= 1
-		elif action == ACTION_GAME_NEW:    self.NewGame()
-		elif action == ACTION_GAME_START:  self.StartGame()
-		elif action == ACTION_GAME_STOP:   self.StopGame()
+		elif action == ACTION_GAME_NEW1:   self.NewGame(1)
+		elif action == ACTION_GAME_NEW2:   self.NewGame(2)
+		elif action == ACTION_GAME_NEW4:   self.NewGame(4)
+		elif action == ACTION_GAME_NEW8:   self.NewGame(8)
 		elif action == ACTION_MOUSE_GRAB:  self.Grab(False)
+		elif action == ACTION_PAUSE:       self.Pause(2)
+		elif action == ACTION_PAUSE_STEP:  self.Pause(2, 1)
 		else:                              self.lastKey = key
 
 		self.keys[key] = self.frame
@@ -469,26 +530,35 @@ class PongClient(Pong):
 	def MouseUp(self, button: int):
 		self.keyFlag &= ~self.mouseButtons.get(button, 0)
 
-	def NewGame(self):
-		super(PongClient, self).NewGame()
+	def NewGame(self, numDiv: int = 0):
+		super(PongClient, self).NewGame(numDiv)
 		self.PlaySound(0)
 
 	def OpenMapping(self):
 		self.keyActions = {
-			pygame.K_ESCAPE:   ACTION_GAME_EXIT,
-			pygame.K_F1:       ACTION_DEBUG_INPUT,
-			pygame.K_F2:       ACTION_GAME_AI,
-			pygame.K_F3:       ACTION_BALL_RESET,
-			pygame.K_F4:       ACTION_GAME_NEW,
-			# pygame.K_F5:       ACTION_GAME_STOP,
-			pygame.K_KP_MINUS: ACTION_BALL_DELETE,
-			pygame.K_KP_PLUS:  ACTION_BALL_ADD,
-			pygame.K_MINUS:    ACTION_BALL_DELETE,
-			pygame.K_PLUS:     ACTION_BALL_ADD,
-			pygame.K_TAB:      ACTION_MOUSE_GRAB,
+			pygame.K_1:            ACTION_BALL_1,
+			pygame.K_2:            ACTION_BALL_2,
+			pygame.K_3:            ACTION_BALL_3,
+			pygame.K_4:            ACTION_BALL_4,
+			pygame.K_BACKSPACE:    ACTION_BALL_RESET,
+			pygame.K_ESCAPE:       ACTION_EXIT,
+			pygame.K_F1:           ACTION_GAME_NEW8,
+			pygame.K_F2:           ACTION_GAME_NEW4,
+			pygame.K_F3:           ACTION_GAME_NEW2,
+			pygame.K_F4:           ACTION_GAME_NEW1,
+			pygame.K_KP_MINUS:     ACTION_BALL_DELETE,
+			pygame.K_KP_PLUS:      ACTION_BALL_ADD,
+			pygame.K_LEFTBRACKET:  ACTION_BALL_DELETE,
+			pygame.K_o:            ACTION_PAUSE_STEP,
+			pygame.K_p:            ACTION_PAUSE,
+			pygame.K_RETURN:       ACTION_GAME_AI,
+			pygame.K_RIGHTBRACKET: ACTION_BALL_ADD,
+			pygame.K_SPACE:        ACTION_DEBUG_INPUT,
+			pygame.K_TAB:          ACTION_MOUSE_GRAB,
 		}
 		self.keyButtons = {
 			pygame.K_a:     BUTTON_LEFT,
+			pygame.K_c:     BUTTON_SQUARE,
 			pygame.K_d:     BUTTON_RIGHT,
 			pygame.K_DOWN:  BUTTON_DOWN,
 			pygame.K_e:     BUTTON_CIRCLE,
@@ -498,11 +568,24 @@ class PongClient(Pong):
 			pygame.K_s:     BUTTON_DOWN,
 			pygame.K_UP:    BUTTON_UP,
 			pygame.K_w:     BUTTON_UP,
+			pygame.K_z:     BUTTON_CIRCLE,
 		}
 		self.mouseButtons = {
 			1: BUTTON_SQUARE,
 			3: BUTTON_CIRCLE,
 		}
+
+	def Pause(self, pause: int, nextPause: int = 0):
+		if pause == 2:
+			self.paused ^= 1
+		else:
+			self.paused = pause
+
+		if self.paused == 0:
+			self.doneFrame = 0
+			self.start     = time()
+
+		self.nextPause = nextPause
 
 	def Physics(self):
 		self.Controls()
@@ -541,12 +624,6 @@ class PongClient(Pong):
 			randTime[1] = now
 
 		return randTime[0]
-
-	def StartGame(self):
-		self.id = -1 if self.id >= 0 else 0
-
-	def StopGame(self):
-		pass
 
 	def Sync(self):
 		if self.id < 0: return
@@ -625,8 +702,14 @@ class PongClient(Pong):
 						self.mousePos[1] = event.pos[1]
 
 			# 3) step
-			self.PhysicsLoop(self.interpolate)
-			self.PlaySounds()
+			if self.paused == 0:
+				self.PhysicsLoop(self.interpolate)
+				self.PlaySounds()
+
+				if self.nextPause and self.doneFrame > 0:
+					self.paused    = 1
+					self.nextPause = 0
+
 			self.Draw()
 			self.Sync()
 			self.UpdateTitle()
