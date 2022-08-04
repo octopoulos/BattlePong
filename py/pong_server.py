@@ -91,7 +91,7 @@ class PongServer(Pong):
 					bid = data[2]
 					if 0 <= bid < len(self.balls):
 						self.balls[bid].Parse(data[:Ball.structSize])
-						self.ballDirty |= (1 << bid)
+						self.dirtyBall |= (1 << bid)
 
 					data = data[Ball.structSize:]
 
@@ -101,7 +101,7 @@ class PongServer(Pong):
 					if 0 <= pid < len(self.paddles):
 						message = data[:Paddle.structSize]
 						self.paddles[pid].Parse(message)
-						self.paddleDirty |= (1 << pid)
+						self.dirtyPaddle |= (1 << pid)
 
 					data = data[Paddle.structSize:]
 
@@ -111,8 +111,8 @@ class PongServer(Pong):
 					if pid < 0: pid = self.AddPlayer(client, wantSlot)
 					self.Send(client, struct.pack('xBB', ord('I'), pid))
 
-					for obj in chain(self.balls, self.paddles):
-						self.Send(client, obj.Format())
+					for obj in chain(self.balls, self.paddles): self.Send(client, obj.Format())
+					for id, wall in enumerate(self.walls): self.Send(client, struct.pack('xBBB', ord('W'), id, wall))
 
 					data = data[3:]
 
@@ -161,14 +161,19 @@ class PongServer(Pong):
 					break
 
 	def ShareObjects(self, objects: List[Body], flag: int, skipId: int = -1):
-		# if flag > 0: print('ShareObjects', flag, skipId)
+		for oid, obj in enumerate(objects):
+			if flag == -1 or (flag & (1 << oid)):
+				message = obj.Format()
+				for sid, slot in enumerate(self.slots):
+					if slot and sid != skipId and obj.parentId != sid:
+						self.Send(slot, message)
 
-		for sid, slot in enumerate(self.slots):
-			if slot and sid != skipId:
-				for oid, obj in enumerate(objects):
-					if obj.parentId != sid and (flag == -1 or (flag & (1 << oid))):
-						self.Send(slot, obj.Format())
-						# print(sid, obj.Format())
+	def ShareWalls(self, flag: int):
+		for id, wall in enumerate(self.walls):
+			if flag == -1 or (flag & (1 << id)):
+				message = struct.pack('xBBB', ord('W'), id, wall)
+				for slot in self.slots:
+					if slot: self.Send(slot, message)
 
 	def Signal(self, handle: pyuv.Signal, signum: int):
 		for client in self.players:
@@ -193,6 +198,7 @@ class PongServer(Pong):
 
 		self.ShareObjects(self.balls, -1)
 		self.ShareObjects(self.paddles, -1)
+		self.ShareWalls(-1)
 
 	# MAIN LOOP
 	###########
@@ -206,14 +212,15 @@ class PongServer(Pong):
 		self.signal_h.start(self.Signal, signal.SIGINT)
 
 		self.NewGame()
-		self.AddBall(2)
+		self.AddBall(1)
 
 		while self.running:
 			self.PhysicsLoop()
 			self.loop.run(pyuv.UV_RUN_NOWAIT)
 
-			if self.ballDirty: self.ShareObjects(self.balls, self.ballDirty)
-			if self.paddleDirty: self.ShareObjects(self.paddles, self.paddleDirty)
+			if self.dirtyBall:   self.ShareObjects(self.balls, self.dirtyBall)
+			if self.dirtyPaddle: self.ShareObjects(self.paddles, self.dirtyPaddle)
+			if self.dirtyWall:   self.ShareWalls(self.dirtyWall)
 
 
 def MainServer(**kwargs):

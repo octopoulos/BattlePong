@@ -40,9 +40,9 @@ ACTION_DEBUG_INPUT = 8
 ACTION_EXIT        = 9
 ACTION_GAME_AI     = 10
 ACTION_GAME_NEW1   = 11
-ACTION_GAME_NEW2   = 12
-ACTION_GAME_NEW4   = 13
-ACTION_GAME_NEW8   = 14
+ACTION_GAME_NEW3   = 12
+ACTION_GAME_NEW5   = 13
+ACTION_GAME_NEW7   = 14
 ACTION_MOUSE_GRAB  = 15
 ACTION_PAUSE       = 16
 ACTION_PAUSE_STEP  = 17
@@ -134,7 +134,9 @@ class PongClient(Pong):
 		self.clock        = pygame.time.Clock()
 		self.debug        = 0                                      # &1: inputs
 		self.font         = None                                   # type: pygame.font.Font
+		self.font2        = None                                   # type: pygame.font.Font
 		self.fontSize     = 32
+		self.fontSize2    = 48
 		self.gamepad      = 0
 		self.grab         = True
 		self.hasMoved     = False
@@ -215,6 +217,16 @@ class PongClient(Pong):
 					pid = data[2]
 					if 0 <= pid < len(self.paddles): self.paddles[pid].Parse(data[:Paddle.structSize])
 					data = data[Paddle.structSize:]
+
+				# wall
+				elif data[1] == ord('W'):
+					wid    = data[2]
+					health = data[3]
+					if wid < len(self.walls):
+						self.walls[wid] = health
+						self.CalculateHealth(wid / self.numDiv, False)
+
+					data = data[4:]
 
 				# 2) connection
 				elif data[1] == ord('I'):
@@ -397,7 +409,7 @@ class PongClient(Pong):
 			x, y   = vertices[i]
 			x2, y2 = vertices[(i + 1) % numVertex]
 			# if not self.frame: print(i, numVertex, (x, y), (x2, y2))
-			health = self.walls[i]
+			health = self.walls[i] / 255
 			thick  = max(int(WALL_THICKNESS * scale), 2)
 			thick2 = max(int(thick / 4 + 0.5), 2)
 
@@ -432,7 +444,7 @@ class PongClient(Pong):
 
 		# paddles
 		for pid, paddle in enumerate(self.paddles):
-			self.DrawText(paddle.position0[0] * 1.08 * scale + size2, -paddle.position0[1] * 1.08 * scale + size2, f'{paddle.score}')
+			self.DrawText(paddle.position0[0] * 1.08 * scale + size2, -paddle.position0[1] * 1.08 * scale + size2, f'{paddle.health}')
 
 			color = PADDLE_COLORS[pid] if self.id == -1 or self.id != pid else (0, 255, 255)
 			if not paddle.alive: color = (80 + color[0] * 0.1, 80 + color[1] * 0.1, 80 + color[2] * 0.1)
@@ -471,9 +483,9 @@ class PongClient(Pong):
 		elif action == ACTION_DEBUG_INPUT: self.debug ^= 1
 		elif action == ACTION_GAME_AI:     self.aiControl ^= 1
 		elif action == ACTION_GAME_NEW1:   self.NewGame(1)
-		elif action == ACTION_GAME_NEW2:   self.NewGame(2)
-		elif action == ACTION_GAME_NEW4:   self.NewGame(4)
-		elif action == ACTION_GAME_NEW8:   self.NewGame(8)
+		elif action == ACTION_GAME_NEW3:   self.NewGame(3)
+		elif action == ACTION_GAME_NEW5:   self.NewGame(5)
+		elif action == ACTION_GAME_NEW7:   self.NewGame(7)
 		elif action == ACTION_MOUSE_GRAB:  self.Grab(False)
 		elif action == ACTION_PAUSE:       self.Pause(2)
 		elif action == ACTION_PAUSE_STEP:  self.Pause(2, 1)
@@ -542,9 +554,9 @@ class PongClient(Pong):
 			pygame.K_4:            ACTION_BALL_4,
 			pygame.K_BACKSPACE:    ACTION_BALL_RESET,
 			pygame.K_ESCAPE:       ACTION_EXIT,
-			pygame.K_F1:           ACTION_GAME_NEW8,
-			pygame.K_F2:           ACTION_GAME_NEW4,
-			pygame.K_F3:           ACTION_GAME_NEW2,
+			pygame.K_F1:           ACTION_GAME_NEW7,
+			pygame.K_F2:           ACTION_GAME_NEW5,
+			pygame.K_F3:           ACTION_GAME_NEW3,
 			pygame.K_F4:           ACTION_GAME_NEW1,
 			pygame.K_KP_MINUS:     ACTION_BALL_DELETE,
 			pygame.K_KP_PLUS:      ACTION_BALL_ADD,
@@ -628,13 +640,13 @@ class PongClient(Pong):
 	def Sync(self):
 		if self.id < 0: return
 
-		if self.hasMoved or (self.paddleDirty & (1 << self.id)):
+		if self.hasMoved or (self.dirtyPaddle & (1 << self.id)):
 			paddle = self.paddles[self.id]
 			self.Send(self.client, paddle.Format())
 
-		if self.ballDirty:
+		if self.dirtyBall:
 			for ball in self.balls:
-				if ball.parentId == self.id:
+				if ball.parentId == self.id and (ball.flag & (1 << self.id)):
 					self.Send(self.client, ball.Format())
 
 		self.hasMoved = False
@@ -646,9 +658,11 @@ class PongClient(Pong):
 		pygame.init()
 		pygame.mixer.init()
 
-		self.fontSize = (int(FONT_SIZE * self.scale) // 8) * 8
-		self.font     = pygame.font.Font(os.path.join(DATA_PATH, 'kenpixel.ttf'), self.fontSize)
-		self.renderer = self.rendererClass()
+		self.fontSize  = (int(FONT_SIZE * self.scale) // 8) * 8
+		self.fontSize2 = (int(FONT_SIZE * self.scale * 1.5) // 8) * 8
+		self.font      = pygame.font.Font(os.path.join(DATA_PATH, 'kenpixel.ttf'), self.fontSize)
+		self.font2     = pygame.font.Font(os.path.join(DATA_PATH, 'kenpixel.ttf'), self.fontSize2)
+		self.renderer  = self.rendererClass()
 
 		flags = pygame.DOUBLEBUF
 		if self.renderer.name == 'opengl': flags |= pygame.OPENGL

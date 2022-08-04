@@ -26,7 +26,7 @@ BALL_ORBIT      = 1.5       # starting orbit
 BALL_SPEED_MAX  = 20
 BALL_SPEED_MED  = 15
 BALL_SPEED_MIN  = 7
-BALL_SPEED_STOP = 1.7
+BALL_SPEED_STOP = 1.2
 BALL_X          = 0.2
 BALL_Y          = 0.2
 PADDLE_ACCEL    = 0.2
@@ -44,7 +44,7 @@ PHYSICS_IT_MAX  = 1000
 PHYSICS_IT_POS  = 3         # number of position iterations
 PHYSICS_IT_VEL  = 8         # number of velocity iterations
 SUN_RADIUS      = 0.2
-WALL_SUBDIVIDE  = 8
+WALL_SUBDIVIDE  = 7
 WALL_THICKNESS  = 0.08
 ZONE_X2         = 6
 ZONE_Y2         = 6
@@ -78,19 +78,18 @@ class Body:
 		self.angle     = angle            # interpolated angle
 		self.angle0    = angle            # initial angle
 		self.angle1    = angle            # prev angle
+		self.flag      = 0
+		self.parentId  = -1               # hit by ... -1 if nothing
 		self.position  = (x, y)           # interpolated position
 		self.position0 = (x, y)           # initial position
 		self.position1 = (x, y)           # prev position
-		self.buttons   = 0                # buttons can be used for prediction
-		self.parentId  = -1               # hit by ... -1 if nothing
-		self.score     = 0
 		self.body      = None
 
 	def __str__(self):
 		body = self.body
 		pos  = body.position
 		vel  = body.linearVelocity
-		return f'<{self.name}: id={self.id} alive={self.alive} pos=({pos[0]},{pos[1]}) vel=({vel[0]},{vel[1]}) rot={body.angle} rotVel={body.angularVelocity} buttons={self.buttons} parentId={self.parentId} score={self.score}>'
+		return f'<{self.name}: id={self.id} alive={self.alive} pos=({pos[0]},{pos[1]}) vel=({vel[0]},{vel[1]}) rot={body.angle} rotVel={body.angularVelocity}>'
 
 	def Format(self) -> bytes:
 		body = self.body
@@ -155,6 +154,9 @@ class Paddle(Body):
 		super(Paddle, self).__init__('Paddle', id, x, y, angle)
 		self.parentId = id
 
+		self.buttons = 0                  # buttons can be used for prediction
+		self.health  = 1
+
 		self.body = world.CreateDynamicBody(
 			allowSleep     = False,
 			angularDamping = 0.1,
@@ -173,11 +175,11 @@ class Paddle(Body):
 		body = self.body
 		pos  = body.position
 		vel  = body.linearVelocity
-		return struct.pack(Paddle.structFmt, self.letter, self.id, self.alive, pos[0], pos[1], vel[0], vel[1], body.angle, body.angularVelocity, self.buttons, self.score)
+		return struct.pack(Paddle.structFmt, self.letter, self.id, self.alive, pos[0], pos[1], vel[0], vel[1], body.angle, body.angularVelocity, self.buttons, self.health)
 
 	def Parse(self, message: bytes) -> bool:
 		body = self.body
-		_, _, alive, posx, posy, velx, vely, body.angle, body.angularVelocity, self.buttons, self.score = struct.unpack(Paddle.structFmt, message)
+		_, _, alive, posx, posy, velx, vely, body.angle, body.angularVelocity, self.buttons, self.health = struct.unpack(Paddle.structFmt, message)
 		self.Alive(alive)
 		body.position       = (posx, posy)
 		body.linearVelocity = (velx, vely)
@@ -194,20 +196,20 @@ class Pong(b2ContactListener):
 		self.port      = DefaultInt(kwargs.get('port'), 1234)
 		self.reconnect = DefaultInt(kwargs.get('reconnect'), 3)
 
-		self.ballDirty   = 0              # which balls must be sent via network (flag)
 		self.connected   = False
+		self.dirtyBall   = 0              # which balls must be sent via network (flag)
+		self.dirtyPaddle = 0              # which paddles must be sent via network (flag)
+		self.dirtyWall   = 0              # wall was hit => paddle id flag
 		self.doneFrame   = 0
 		self.frame       = 0
 		self.hitFlag     = 0
 		self.id          = -1
 		self.ideltas     = [0] * 8        # previous [pframe - iframe] deltas
 		self.iframe      = -1             # frame where prev Physics was simulated
-		self.paddleDirty = 0              # which paddles must be sent via network (flag)
 		self.pframe      = -1             # frame where current Physics was simulated
 		self.sdelta      = 0              # average of ideltas
 		self.start       = time()
-		self.wallDirty   = 0
-		self.walls       = [1] * 16       # wall energy
+		self.walls       = [255] * 16     # wall energy
 
 		self.world                   = b2World(gravity=(0, 0), doSleep=True)
 		self.world.contactListener   = self
@@ -255,15 +257,15 @@ class Pong(b2ContactListener):
 	def BeginContact(self, contact: b2Contact):
 		self.Contact(contact, False)
 
-	def CalculateScore(self, pid: int, makeDirty: bool):
-		score = 0
+	def CalculateHealth(self, pid: int, makeDirty: bool):
+		health = 0
 		start = pid * self.numDiv
-		for i in range(self.numDiv): score += (1 if self.walls[start + i] > 0 else 0)
+		for i in range(self.numDiv): health += (1 if self.walls[start + i] > 0 else 0)
 
-		paddle       = self.paddles[pid]
-		paddle.score = score
-		if score == 0: paddle.Alive(0)
-		if makeDirty: self.paddleDirty |= (1 << pid)
+		paddle        = self.paddles[pid]
+		paddle.health = health
+		if health == 0: paddle.Alive(0)
+		if makeDirty: self.dirtyPaddle |= (1 << pid)
 
 	def Contact(self, contact: b2Contact, isEnd: bool):
 		bodyA         = contact.fixtureA.body
@@ -272,43 +274,45 @@ class Pong(b2ContactListener):
 		nameB, idB, B = bodyB.userData
 
 		if nameA == 'B':
-			self.ballDirty |= (1 << idA)
+			self.dirtyBall |= (1 << idA)
 			if nameB == 'B':
 				if not isEnd: self.hitFlag |= HIT_BALL_BALL
-				self.ballDirty |= (1 << idB)
+				self.dirtyBall |= (1 << idB)
 			elif nameB == 'P':
 				if not isEnd: self.hitFlag |= HIT_BALL_PADDLE
-				self.paddleDirty |= (1 << idB)
+				self.dirtyPaddle |= (1 << idB)
+				A.flag |= (1 << idB)
 				A.parentId = idB
 			elif nameB == 'S':
-				self.ballDirty |= (1 << idB)
-				A.score = -1
+				self.dirtyBall |= (1 << idB)
+				A.flag |= 128
 			elif nameB == 'W':
 				self.ContactBallWall(A, contact.childIndexB, isEnd)
 		#
 		elif nameA == 'P':
-			self.paddleDirty |= (1 << idA)
+			self.dirtyPaddle |= (1 << idA)
 			if nameB == 'B':
 				if not isEnd: self.hitFlag |= HIT_BALL_PADDLE
-				self.ballDirty |= (1 << idB)
+				self.dirtyBall |= (1 << idB)
+				B.flag |= (1 << idA)
 				B.parentId = idA
 			elif nameB == 'P':
 				if not isEnd: self.hitFlag |= HIT_PADDLE_PADDLE
-				self.paddleDirty |= (1 << idB)
+				self.dirtyPaddle |= (1 << idB)
 			elif nameB == 'W':
 				if not isEnd: self.hitFlag |= HIT_PADDLE_WALL
 		#
 		elif nameA == 'S':
 			if nameB == 'B':
-				self.ballDirty |= (1 << idA)
-				B.score = -1
+				self.dirtyBall |= (1 << idA)
+				B.flag |= 128
 		#
 		elif nameA == 'W':
 			if nameB == 'B':
 				self.ContactBallWall(B, contact.childIndexA, isEnd)
 			elif nameB == 'P':
 				if not isEnd: self.hitFlag |= HIT_PADDLE_WALL
-				self.paddleDirty |= (1 << idB)
+				self.dirtyPaddle |= (1 << idB)
 
 	def ContactBallWall(self, ball: Ball, childId: int, isEnd: bool):
 		wallId = childId // self.numDiv
@@ -322,16 +326,16 @@ class Pong(b2ContactListener):
 				# reduce self damage
 				if ball.parentId == wallId: speed2 *= 0.5
 
-				self.walls[childId] = max(health - speed2 * 0.0025, 0)
-				self.CalculateScore(wallId, True)
+				self.walls[childId] = max(int(health - speed2 * 0.64), 0)
+				self.CalculateHealth(wallId, True)
 
 				# vampire
 				if ball.parentId >= 0 and wallId != ball.parentId:
 					self.RepairWall(ball.parentId, health - self.walls[childId])
 
-				self.wallDirty |= (1 << wallId)
+				self.dirtyWall |= (1 << childId)
 
-		self.ballDirty |= (1 << ball.id)
+		self.dirtyBall |= (1 << ball.id)
 		if ball.parentId >= 0 and self.walls[childId] > 0: ball.parentId = -1
 
 	def CreateWalls(self):
@@ -351,7 +355,7 @@ class Pong(b2ContactListener):
 
 		if len(self.wall.fixtures): self.wall.DestroyFixture(self.wall.fixtures[0])
 		self.wall.CreateLoopFixture(vertices=vertices)
-		self.walls = [1] * (len(vertices) + 1)
+		self.walls = [255] * (len(vertices) + 1)
 
 	def DeleteBall(self):
 		if len(self.balls) > 1:
@@ -417,10 +421,10 @@ class Pong(b2ContactListener):
 		for obj in chain(self.balls, self.paddles): obj.Reset()
 		self.ResetBalls()
 
-		for i in range(len(self.walls)): self.walls[i] = 1
+		for i in range(len(self.walls)): self.walls[i] = 255
 
 		for pid, paddle in enumerate(self.paddles):
-			self.CalculateScore(pid, False)
+			self.CalculateHealth(pid, False)
 			paddle.Alive(1)
 
 		self.doneFrame = 0
@@ -432,13 +436,13 @@ class Pong(b2ContactListener):
 	def Physics(self):
 		# sun gravity
 		for ball in self.balls:
-			body   = ball.body
-			pos    = body.position
-			grav   = 0.02 / (pos[0] * pos[0] + pos[1] * pos[1] + 0.1)
-			hitSun = (ball.score == -1)
-			if hitSun:
-				grav = -grav * 15 - 10
-				ball.score = 0
+			body = ball.body
+			pos  = body.position
+			grav = 0.02 / (pos[0] * pos[0] + pos[1] * pos[1] + 0.1)
+
+			# hit sun
+			if ball.flag & 128: grav = -grav * 15 - 10
+
 			force = (-pos[0] * grav, -pos[1] * grav)
 			body.ApplyForceToCenter(force, True)
 
@@ -481,10 +485,12 @@ class Pong(b2ContactListener):
 		elapsed   = time() - self.start
 		wantFrame = elapsed * PHYSICS_FPS
 
-		self.ballDirty   = 0
+		for ball in self.balls: ball.flag = 0
+
+		self.dirtyBall   = 0
 		self.hitFlag     = 0
-		self.paddleDirty = 0
-		self.wallDirty   = 0
+		self.dirtyPaddle = 0
+		self.dirtyWall   = 0
 
 		if self.doneFrame < wantFrame:
 			if interpolate:
@@ -502,7 +508,7 @@ class Pong(b2ContactListener):
 
 		for _ in range(self.numDiv):
 			bestId    = -1
-			bestScore = 1
+			bestScore = 255
 			for i in range(self.numDiv):
 				if (wall := self.walls[start + i]) > 0 and wall < bestScore:
 					bestId    = i + start
@@ -511,12 +517,12 @@ class Pong(b2ContactListener):
 			if bestId < 0: break
 
 			wall               = self.walls[bestId]
-			self.walls[bestId] = min(wall + health, 1)
+			self.walls[bestId] = min(wall + health, 255)
 
 			health -= (self.walls[bestId] - wall)
 			if health <= 0: break
 
-		self.CalculateScore(pid, True)
+		self.CalculateHealth(pid, True)
 
 	def ResetBall(self, ball: Ball, recenter: bool = True):
 		# angle between 0 + eps and PI/2 - eps
@@ -532,7 +538,7 @@ class Pong(b2ContactListener):
 		ball.alive          = 1
 		body.linearVelocity = (speed * cos(angle) * (1 if random() > 0.5 else -1), speed * sin(angle) * (1 if random() > 0.5 else -1))
 
-		self.ballDirty |= (1 << ball.id)
+		self.dirtyBall |= (1 << ball.id)
 
 	def ResetBalls(self, recenter: bool = True):
 		for ball in self.balls: self.ResetBall(ball, recenter)
