@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-08-02
+# @version 2022-08-04
 
 """
 Pong common
@@ -12,13 +12,14 @@ from math import cos, pi, sin
 from random import random
 import struct
 from time import time
+from typing import Tuple
 
 from Box2D import b2CircleShape, b2Contact, b2ContactListener, b2FixtureDef, b2PolygonShape, b2World
 import pyuv
 
 from common import DefaultInt
 
-VERSION = '2022-08-02'
+VERSION = '2022-08-04'
 
 # game
 BALL_ANGLE      = 0.3       # min starting throw angle
@@ -65,9 +66,25 @@ HIT_BALL_WALL     = 1 << 2
 HIT_PADDLE_PADDLE = 1 << 3
 HIT_PADDLE_WALL   = 1 << 4
 
+TIMEOUT_PING       = 0.3
+TIMEOUT_DISCONNECT = 1.5
 
+
+class UdpHeader:
+	structFmt  = 'H'
+	structSize = struct.calcsize(structFmt)
+
+	def Format(self, sequence: int):
+		return struct.pack(UdpHeader.structFmt, sequence)
+
+	def Parse(self, message: bytes) -> int:
+		[sequence] = struct.unpack(UdpHeader.structFmt, message)
+		return sequence
+
+
+# https://gafferongames.com/post/reliable_ordered_messages/
 class Body:
-	structFmt  = 'xBBBffffff'
+	structFmt  = 'BBBffffff'
 	structSize = struct.calcsize(structFmt)
 
 	def __init__(self, name: str, id: int, x: float, y: float, angle: float):
@@ -118,7 +135,7 @@ class Body:
 
 
 class Ball(Body):
-	structFmt  = 'xBBBffffffb'
+	structFmt  = 'BBBffffffb'
 	structSize = struct.calcsize(structFmt)
 
 	def __init__(self, world: b2World, id: int, x: float, y: float, angle: float):
@@ -147,7 +164,7 @@ class Ball(Body):
 
 
 class Paddle(Body):
-	structFmt  = 'xBBBffffffih'
+	structFmt  = 'BBBffffffih'
 	structSize = struct.calcsize(structFmt)
 
 	def __init__(self, world: b2World, id: int, x: float, y: float, angle: float):
@@ -196,20 +213,24 @@ class Pong(b2ContactListener):
 		self.port      = DefaultInt(kwargs.get('port'), 1234)
 		self.reconnect = DefaultInt(kwargs.get('reconnect'), 3)
 
-		self.connected   = False
-		self.dirtyBall   = 0              # which balls must be sent via network (flag)
-		self.dirtyPaddle = 0              # which paddles must be sent via network (flag)
-		self.dirtyWall   = 0              # wall was hit => paddle id flag
+		self.address     = (self.host, self.port)
+		self.dirtyBall   = 0                                # which balls must be sent via network (flag)
+		self.dirtyPaddle = 0                                # which paddles must be sent via network (flag)
+		self.dirtyWall   = 0                                # wall was hit => paddle id flag
 		self.doneFrame   = 0
 		self.frame       = 0
 		self.hitFlag     = 0
 		self.id          = -1
-		self.ideltas     = [0] * 8        # previous [pframe - iframe] deltas
-		self.iframe      = -1             # frame where prev Physics was simulated
-		self.pframe      = -1             # frame where current Physics was simulated
-		self.sdelta      = 0              # average of ideltas
+		self.ideltas     = [0] * 8                          # previous [pframe - iframe] deltas
+		self.iframe      = -1                               # frame where prev Physics was simulated
+		self.pframe      = -1                               # frame where current Physics was simulated
+		self.sdelta      = 0                                # average of ideltas
+		self.seqRecv     = 0
+		self.seqSent     = 0
 		self.start       = time()
-		self.walls       = [255] * 16     # wall energy
+		self.udpHandle   = None                             # type: pyuv.UDP
+		self.udpHeader   = UdpHeader()
+		self.walls       = [255] * 16                       # wall energy
 
 		self.world                   = b2World(gravity=(0, 0), doSleep=True)
 		self.world.contactListener   = self
@@ -239,11 +260,12 @@ class Pong(b2ContactListener):
 	# NETWORK
 	#########
 
-	def Send(self, server: pyuv.TCP, data: bytes or str, log: bool = False):
-		if not self.connected: return
+	def Send(self, address: Tuple[str, int], data: bytes or str, log: bool = False):
 		if log: print('>', data)
 		if isinstance(data, str): data = data.encode()
-		server.write(data)
+
+		self.udpHandle.send(address, self.udpHeader.Format(self.seqSent) + data)
+		self.seqSent = (self.seqSent + 1) % 65536
 
 	# GAME
 	######
@@ -259,7 +281,9 @@ class Pong(b2ContactListener):
 
 	def CalculateHealth(self, pid: int, makeDirty: bool):
 		health = 0
-		start = pid * self.numDiv
+		start  = pid * self.numDiv
+		if start + self.numDiv > len(self.walls): return
+		# print('start=', start, 'numDiv=', self.numDiv, 'walls=', len(self.walls), self.walls)
 		for i in range(self.numDiv): health += (1 if self.walls[start + i] > 0 else 0)
 
 		paddle        = self.paddles[pid]

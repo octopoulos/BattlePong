@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-08-01
+# @version 2022-08-03
 
 """
 Main
@@ -21,6 +21,7 @@ def main():
 	add('--host'       , nargs='?', default='127.0.0.1',                type=str  , help='Server address')
 	add('--interpolate', nargs='?', default=1          , const=1      , type=int  , help='Interpolate physics')
 	add('--port'       , nargs='?', default=9000       ,                type=int  , help='Server port')
+	add('--protocol'   , nargs='?', default='tcp'      , const='tcp'  , type=str  , help='Network protocol', choices=['tcp', 'udp'])
 	add('--reconnect'  , nargs='?', default=3          ,                type=float, help='Reconnect every x sec')
 	add('--renderer'   , nargs='?', default='basic'    , const='basic', type=str  , help='Renderer to use', choices=['basic', 'opengl'])
 	add('--server'     , nargs='?', default=0          , const=1      , type=int  , help='Run a server')

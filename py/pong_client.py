@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-08-02
+# @version 2022-08-04
 
 """
 Pong client
@@ -19,7 +19,7 @@ import pyuv
 
 from common import DefaultInt
 from pong_common import Ball, BALL_X2, Paddle, PADDLE_FAR2, PADDLE_HIT, PADDLE_IMPULSE, PADDLE_NEAR2, PADDLE_X2, \
-	PADDLE_Y2, Pong, SUN_RADIUS, WALL_THICKNESS, ZONE_X2, ZONE_Y2
+	PADDLE_Y2, Pong, SUN_RADIUS, TIMEOUT_DISCONNECT, TIMEOUT_PING, UdpHeader, WALL_THICKNESS, ZONE_X2, ZONE_Y2
 from renderer_basic import Renderer, RendererBasic
 from renderer_opengl import RendererOpenGL
 
@@ -130,8 +130,9 @@ class PongClient(Pong):
 		self.actions      = {}
 		self.aiControl    = 0                                      # AI plays for the player
 		self.axes         = AXES_ZERO[:]                           # axes values
-		self.client       = None                                   # type: pyuv.TCP
+		self.clientTcp    = None                                   # type: pyuv.TCP
 		self.clock        = pygame.time.Clock()
+		self.connected    = False
 		self.debug        = 0                                      # &1: inputs
 		self.font         = None                                   # type: pygame.font.Font
 		self.font2        = None                                   # type: pygame.font.Font
@@ -154,6 +155,8 @@ class PongClient(Pong):
 		self.padButtons   = list(range(16))                        # button mapping
 		self.padFlag      = 0                                      # actions pushed, from gamepad
 		self.paused       = 0
+		self.pingTime     = time()
+		self.pongTime     = time()
 		self.randAngle    = [0.5, 0.0]                             # decide to rotate
 		self.randMove     = [0.5, 0.0]                             # decide edge or center
 		self.renderer     = None                                   # type: Renderer
@@ -182,69 +185,88 @@ class PongClient(Pong):
 	# NETWORK
 	#########
 
-	def OnConnect(self, server: pyuv.TCP, error: int):
-		if error:
-			self.connected = False
-			return
-		print('OnConnect', error)
-		self.connected = True
-		self.Send(server, struct.pack('xBb', ord('I'), self.id))
-		server.start_read(self.OnRead)
+	def CheckReconnect(self):
+		mustPing = 0
+		now      = time()
+		if now > self.pongTime + TIMEOUT_DISCONNECT:
+			mustPing = 2
+		elif now > self.pongTime + TIMEOUT_PING:
+			mustPing = 1
 
-	def OnRead(self, server: pyuv.TCP, data: bytes, error: int):
-		if data is None:
-			print('OnRead: Disconnected')
-			self.connected = False
-			self.client.close()
-			self.client = None
-			return
-
-		while len(data):
-			if data[0] == 0:
-				# 1) game
-				# ball
-				if data[1] == ord('B'):
-					bid = data[2]
-					while bid >= len(self.balls): self.AddBall()
-
-					self.balls[bid].Parse(data[:Ball.structSize])
-					self.doneFrame = 0
-					self.start     = time()
-					data           = data[Ball.structSize:]
-
-				# paddle
-				elif data[1] == ord('P'):
-					pid = data[2]
-					if 0 <= pid < len(self.paddles): self.paddles[pid].Parse(data[:Paddle.structSize])
-					data = data[Paddle.structSize:]
-
-				# wall
-				elif data[1] == ord('W'):
-					wid    = data[2]
-					health = data[3]
-					if wid < len(self.walls):
-						self.walls[wid] = health
-						self.CalculateHealth(wid / self.numDiv, False)
-
-					data = data[4:]
-
-				# 2) connection
-				elif data[1] == ord('I'):
-					self.id = data[2]
-					data    = data[3:]
-					self.UpdateTitle()
-				else:
-					print('server:', data)
-					break
+		if mustPing and now > self.pingTime + TIMEOUT_PING:
+			if mustPing == 2:
+				print('CheckReconnect: disconnected')
+				self.connected = False
+				self.Send(self.address, struct.pack('Bb', ord('I'), self.id))
 			else:
-				print('server:', data)
-				break
+				self.Send(self.address, b'p')
+			self.pingTime = now
 
 	def Signal(self, handle: pyuv.Signal, signum: int):
 		self.signal_h.close()
-		self.client.close()
-		self.client  = None
+
+		if self.clientTcp:
+			self.clientTcp.close()
+			self.clientTcp = None
+
+		if self.udpHandle:
+			self.udpHandle.close()
+			self.udpHandle = None
+
 		self.running = False
+
+	def UdpClientRead(self, handle: pyuv.UDP, address: Tuple[str, int], flags: int, data: bytes, error: int):
+		if data is None: return
+
+		seq   = self.udpHeader.Parse(data[:UdpHeader.structSize])
+		delta = seq - self.seqRecv
+		# 100 => 65000
+		if delta > 32768 or -32768 < delta < 0:
+			print('seq is older', seq, '<', self.seqRecv)
+		else:
+			self.seqRcv = seq
+
+		data           = data[UdpHeader.structSize:]
+		now            = time()
+		self.connected = True
+		self.pongTime  = now
+
+		# 1) game
+		# ball
+		if data[0] == ord('B'):
+			bid = data[1]
+			while bid >= len(self.balls): self.AddBall()
+
+			self.balls[bid].Parse(data[:Ball.structSize])
+			self.doneFrame = 0
+			self.start     = now
+
+		# paddle
+		elif data[0] == ord('P'):
+			pid = data[1]
+			if 0 <= pid < len(self.paddles): self.paddles[pid].Parse(data[:Paddle.structSize])
+			data = data[Paddle.structSize:]
+
+		# wall
+		elif data[0] == ord('W'):
+			wid    = data[1]
+			health = data[2]
+			if wid < len(self.walls):
+				self.walls[wid] = health
+				self.CalculateHealth(wid // self.numDiv, False)
+
+			data = data[4:]
+
+		# 2) connection
+		elif data[0] == ord('p'): self.Send(self.address, b'q')
+		elif data[0] == ord('q'): print('pong!', now)
+
+		elif data[0] == ord('I'):
+			self.id = data[1]
+			data    = data[2:]
+			self.UpdateTitle()
+		else:
+			print('TcpServer:', data)
 
 	# GAME
 	######
@@ -335,6 +357,7 @@ class PongClient(Pong):
 		# disconnected => move all paddles
 		if self.id >= 0:
 			ids = [self.id]
+			if self.id > 3: return
 		else:
 			ids = [0, 1, 2, 3]
 
@@ -638,16 +661,16 @@ class PongClient(Pong):
 		return randTime[0]
 
 	def Sync(self):
-		if self.id < 0: return
+		if self.id < 0 or self.id > 3: return
 
 		if self.hasMoved or (self.dirtyPaddle & (1 << self.id)):
 			paddle = self.paddles[self.id]
-			self.Send(self.client, paddle.Format())
+			self.Send(self.address, paddle.Format())
 
 		if self.dirtyBall:
 			for ball in self.balls:
 				if ball.parentId == self.id and (ball.flag & (1 << self.id)):
-					self.Send(self.client, ball.Format())
+					self.Send(self.address, ball.Format())
 
 		self.hasMoved = False
 
@@ -670,6 +693,11 @@ class PongClient(Pong):
 		self.screen          = pygame.display.set_mode((self.size, self.size), flags=flags)
 		self.renderer.screen = self.screen
 
+		self.udpHandle = pyuv.UDP(self.loop)
+		self.udpHandle.bind(('127.0.0.1', 0))
+		self.udpHandle.start_recv(self.UdpClientRead)
+		self.Send(self.address, struct.pack('Bb', ord('I'), self.id))
+
 		self.signal_h.start(self.Signal, signal.SIGINT)
 
 		self.GamePadInit()
@@ -679,15 +707,9 @@ class PongClient(Pong):
 		self.NewGame()
 		# self.AddBall(2)
 
-		connectTime = 0
-
 		while self.running:
 			# 0) reconnect
-			if not self.connected:
-				if (now := time()) > connectTime + self.reconnect:
-					connectTime = now
-					self.client = pyuv.TCP(self.loop)
-					self.client.connect((self.host, self.port), self.OnConnect)
+			if self.reconnect: self.CheckReconnect()
 
 			# 1) uv_loop
 			self.loop.run(pyuv.UV_RUN_NOWAIT)

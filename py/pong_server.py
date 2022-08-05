@@ -1,6 +1,6 @@
 # coding: utf-8
 # @author octopoulo <polluxyz@gmail.com>
-# @version 2022-08-02
+# @version 2022-08-04
 
 """
 Pong server
@@ -10,11 +10,12 @@ from itertools import chain
 from math import sqrt
 import signal
 import struct
-from typing import List
+from time import time
+from typing import List, Tuple
 
 import pyuv
 
-from pong_common import Ball, Body, Paddle, Pong
+from pong_common import Ball, Body, Paddle, Pong, TIMEOUT_DISCONNECT, TIMEOUT_PING, UdpHeader
 
 
 class PongServer(Pong):
@@ -22,34 +23,49 @@ class PongServer(Pong):
 		super(PongServer, self).__init__(**kwargs)
 		print('PongServer', kwargs)
 
-		self.connId  = 0
-		self.id      = 0
-		self.players = {}
-		self.running = True
-		self.server  = None                                 # type: pyuv.TCP
-		self.slots   = [None, None, None, None]
+		self.connId    = 0
+		self.id        = 0
+		self.players   = {}
+		self.running   = True
+		self.serverTcp = None                               # type: pyuv.TCP
+		self.serverUdp = None                               # type: pyuv.UDP
+		self.slots     = [None, None, None, None]
 
-		self.loop     = pyuv.Loop.default_loop()
-		self.signal_h = pyuv.Signal(self.loop)
+		self.loop      = pyuv.Loop.default_loop()
+		self.signal_h  = pyuv.Signal(self.loop)
 
 	# HELPERS
 	#########
 
-	def AddPlayer(self, client: pyuv.TCP, wantSlot: int) -> int:
-		ip, port = client.getpeername()
-		slot     = self.FindSlot(wantSlot)
-		if slot < len(self.slots): self.slots[slot] = client
-		self.players[client] = [slot, ip, port, 0, 0, 0]
+	def AddPlayer(self, address: Tuple[str, int], wantSlot: int) -> int:
+		slot = self.FindSlot(wantSlot)
+		if slot < len(self.slots): self.slots[slot] = address
+		self.players[address] = [slot, time(), time()]
 		print('AddPlayer: players=')
 		self.PrintPlayers()
 		return slot
 
-	def DeletePlayer(self, client: pyuv.TCP):
-		if player := self.players.get(client):
-			self.slots[player[0]] = None
-			del self.players[client]
-			print('DeletePlayer: players=')
+	def CheckPlayers(self):
+		now     = time()
+		removes = set()
+
+		for address, player in self.players.items():
+			if now > player[1] + TIMEOUT_DISCONNECT:
+				removes.add(address)
+			elif now > player[1] + TIMEOUT_PING and now > player[2] + TIMEOUT_PING:
+				self.Send(address, b'p')
+				player[2] = now
+
+		if removes:
+			for remove in removes: self.DeletePlayer(remove, False)
 			self.PrintPlayers()
+
+	def DeletePlayer(self, address: Tuple[str, int], log: bool = True):
+		if player := self.players.get(address):
+			self.slots[player[0]] = None
+			del self.players[address]
+			print(f'DeletePlayer: {address}')
+			if log: self.PrintPlayers()
 
 	def FindSlot(self, wantSlot: int) -> int:
 		numSlot = len(self.slots)
@@ -61,104 +77,12 @@ class PongServer(Pong):
 		return numSlot
 
 	def PrintPlayers(self):
-		print(self.slots)
+		print('slots=', self.slots)
 		for key, value in self.players.items():
 			print(' ', key, value)
 
 	# NETWORK
 	#########
-
-	def OnConnect(self, server: pyuv.TCP, error: int):
-		self.connId += 1
-		client = pyuv.TCP(self.loop)
-		self.server.accept(client)
-		client.start_read(self.OnRead)
-
-	def OnRead(self, client: pyuv.TCP, data: bytes, error: int):
-		if data is None:
-			client.close()
-			self.DeletePlayer(client)
-			return
-
-		player = self.players.get(client)
-		pid    = player[0] if player else -1
-
-		while len(data):
-			if data[0] == 0:
-				# 1) game
-				# ball
-				if data[1] == ord('B'):
-					bid = data[2]
-					if 0 <= bid < len(self.balls):
-						self.balls[bid].Parse(data[:Ball.structSize])
-						self.dirtyBall |= (1 << bid)
-
-					data = data[Ball.structSize:]
-
-				# paddle
-				elif data[1] == ord('P'):
-					pid = data[2]
-					if 0 <= pid < len(self.paddles):
-						message = data[:Paddle.structSize]
-						self.paddles[pid].Parse(message)
-						self.dirtyPaddle |= (1 << pid)
-
-					data = data[Paddle.structSize:]
-
-				# 2) connection
-				elif data[1] == ord('I'):
-					wantSlot = data[2]
-					if pid < 0: pid = self.AddPlayer(client, wantSlot)
-					self.Send(client, struct.pack('xBB', ord('I'), pid))
-
-					for obj in chain(self.balls, self.paddles): self.Send(client, obj.Format())
-					for id, wall in enumerate(self.walls): self.Send(client, struct.pack('xBBB', ord('W'), id, wall))
-
-					data = data[3:]
-
-				else:
-					print(f'player_{pid}:', data)
-			else:
-				if data[0: 5] == b'GET /':
-					i = 5
-					size = len(data)
-					while i < size:
-						if data[i] == 0:
-							data = data[i:]
-							break
-						i += 1
-
-					if i == size: data = data[i:]
-
-					speed = self.balls[0].body.linearVelocity
-					html  = ''.join([
-						'<html>',
-						'<body>',
-							'<h1>Battle Pong</h1>',
-							f'<div>Balls: {len(self.balls)}</div>',
-							f'<div>Players: {len(self.players)}</div>',
-							f'<div>Speed: {sqrt(speed[0] * speed[1] + speed[1] * speed[1])}</div>',
-						'</body>',
-						'</html>',
-					])
-
-					response = '\r\n'.join([
-						'HTTP/1.1 200 OK',
-						'Date: Sun, 18 Oct 2012 10:36:20 GMT',
-						'Server: Custom/1.0.0',
-						f'Content-Length: {len(html) + 4}',
-						'Content-Type: text/html; charset=UTF-8',
-						'',
-						html,
-						'<html><body><h1>Hello there!</h1></body></html>',
-						'',
-						'',
-					])
-					self.Send(client, response)
-					self.DeletePlayer(client)
-				else:
-					print(f'player_{pid}:', data)
-					break
 
 	def ShareObjects(self, objects: List[Body], flag: int, skipId: int = -1):
 		for oid, obj in enumerate(objects):
@@ -171,7 +95,7 @@ class PongServer(Pong):
 	def ShareWalls(self, flag: int):
 		for id, wall in enumerate(self.walls):
 			if flag == -1 or (flag & (1 << id)):
-				message = struct.pack('xBBB', ord('W'), id, wall)
+				message = struct.pack('BBB', ord('W'), id, wall)
 				for slot in self.slots:
 					if slot: self.Send(slot, message)
 
@@ -183,8 +107,115 @@ class PongServer(Pong):
 				pass
 
 		self.signal_h.close()
-		self.server.close()
+
+		if self.serverTcp:
+			self.serverTcp.close()
+			self.serverTcp = None
+
+		if self.serverUdp:
+			self.serverUdp.close()
+			self.serverUdp = None
+
 		self.running = False
+
+	def TcpListen(self, server: pyuv.TCP, error: int):
+		self.connId += 1
+		client = pyuv.TCP(self.loop)
+		self.serverTcp.accept(client)
+		client.start_read(self.TcpServerRead)
+
+	def TcpServerRead(self, client: pyuv.TCP, data: bytes, error: int):
+		if data is None: return
+
+		while len(data):
+			if data[0: 5] == b'GET /':
+				i = 5
+				size = len(data)
+				while i < size:
+					if data[i] == 0:
+						data = data[i:]
+						break
+					i += 1
+
+				if i == size: data = data[i:]
+
+				speed = self.balls[0].body.linearVelocity
+				html  = ''.join([
+					'<html>',
+					'<body>',
+						'<h1>Battle Pong</h1>',
+						f'<div>Balls: {len(self.balls)}</div>',
+						f'<div>Players: {len(self.players)}</div>',
+						f'<div>Speed: {sqrt(speed[0] * speed[1] + speed[1] * speed[1])}</div>',
+					'</body>',
+					'</html>',
+				])
+
+				response = '\r\n'.join([
+					'HTTP/1.1 200 OK',
+					'Date: Sun, 18 Oct 2012 10:36:20 GMT',
+					'Server: Custom/1.0.0',
+					f'Content-Length: {len(html) + 4}',
+					'Content-Type: text/html; charset=UTF-8',
+					'',
+					html,
+					'<html><body><h1>Hello there!</h1></body></html>',
+					'',
+					'',
+				])
+				client.write(response.encode())
+			else:
+				print(f'TcpServerRead:', data)
+				break
+
+	def UdpOnRead(self, handle: pyuv.UDP, address: Tuple[str, int], flags: int, data: bytes, error: int):
+		if data is None: return
+
+		seq = self.udpHeader.Parse(data[:UdpHeader.structSize])
+		if seq < self.seqRecv and (self.seqRecv < 64512 or seq > 1024):
+			print('seq=', seq, '<', self.seqRecv)
+		else:
+			self.seqRcv = seq
+
+		data = data[UdpHeader.structSize:]
+
+		player = self.players.get(address)
+		if player:
+			pid       = player[0]
+			player[1] = time()
+		else:
+			pid = -1
+
+		# 1) game
+		# ball
+		if data[0] == ord('B'):
+			bid = data[1]
+			if 0 <= bid < len(self.balls):
+				self.balls[bid].Parse(data[:Ball.structSize])
+				self.dirtyBall |= (1 << bid)
+
+		# paddle
+		elif data[0] == ord('P'):
+			pid = data[1]
+			if 0 <= pid < len(self.paddles):
+				message = data[:Paddle.structSize]
+				self.paddles[pid].Parse(message)
+				self.dirtyPaddle |= (1 << pid)
+
+		# 2) connection
+		elif data[0] == ord('p'): self.Send(address, b'q')
+		elif data[0] == ord('q'):
+			print('pong!', pid, address, player)
+
+		elif data[0] == ord('I'):
+			wantSlot = data[1]
+			if pid < 0: pid = self.AddPlayer(address, wantSlot)
+			self.Send(address, struct.pack('BB', ord('I'), pid))
+
+			for obj in chain(self.balls, self.paddles): self.Send(address, obj.Format())
+			for id, wall in enumerate(self.walls): self.Send(address, struct.pack('BBB', ord('W'), id, wall))
+		else:
+			print(f'UdpOnRead_{pid}:', data)
 
 	# GAME
 	######
@@ -204,10 +235,14 @@ class PongServer(Pong):
 	###########
 
 	def Run(self):
-		self.server = pyuv.TCP(self.loop)
-		self.server.bind((self.host, self.port))
-		self.server.listen(self.OnConnect)
-		self.connected = True
+		self.serverTcp = pyuv.TCP(self.loop)
+		self.serverTcp.nodelay(True)
+		self.serverTcp.bind((self.host, self.port + 80))
+		self.serverTcp.listen(self.TcpListen)
+
+		self.udpHandle = pyuv.UDP(self.loop)
+		self.udpHandle.bind(('127.0.0.1', 9000))
+		self.udpHandle.start_recv(self.UdpOnRead)
 
 		self.signal_h.start(self.Signal, signal.SIGINT)
 
@@ -221,6 +256,8 @@ class PongServer(Pong):
 			if self.dirtyBall:   self.ShareObjects(self.balls, self.dirtyBall)
 			if self.dirtyPaddle: self.ShareObjects(self.paddles, self.dirtyPaddle)
 			if self.dirtyWall:   self.ShareWalls(self.dirtyWall)
+
+			self.CheckPlayers()
 
 
 def MainServer(**kwargs):
